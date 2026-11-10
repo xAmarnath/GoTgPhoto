@@ -24,7 +24,7 @@ WEBDAV_PASSWORD_HASH='$2a$12$....paste.here....'
 WEBDAV_ENC_PASSPHRASE=some-strong-passphrase
 ```
 
-**Single-quote the hash. This is load-bearing.** An unquoted line like `WEBDAV_PASSWORD_HASH=$2a$12$abc...` will have `$2a`, `$12`, and `$abc` expanded by the `.env` loader into empty strings, producing a corrupted hash that silently 401s forever. Working example:
+**Single-quote the hash. This is load-bearing.** An unquoted line like `WEBDAV_PASSWORD_HASH=$2a$12$abc...` will have `$2a`, `$12`, and `$abc` expanded by the `.env` loader into empty strings, producing a corrupted hash that silently 401s forever. Use the complete hash generated above in place of this placeholder:
 
 ```bash
 WEBDAV_PASSWORD_HASH='$2a$12$....paste.here....'
@@ -43,12 +43,20 @@ curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/dav/
 # 401 means mounted; 404 means still disabled
 ```
 
+Before running authenticated commands, set these variables in your Bash or Git Bash shell. Enter the same password you used to generate the bcrypt hash; it is read without echoing it or putting it in shell history.
+
+```bash
+read -rp 'WebDAV username: ' WEBDAV_USERNAME
+read -rsp 'WebDAV password: ' WEBDAV_PASSWORD
+printf '\n'
+```
+
 ## TL;DR smoke
 
 > **Smoke test (under a minute) — one curl proves the mount is alive:**
 
 ```bash
-curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X OPTIONS http://127.0.0.1:8080/dav/
+curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X OPTIONS http://127.0.0.1:8080/dav/
 ```
 
 **expect:** `200 OK`, empty body, and these headers verbatim:
@@ -61,7 +69,7 @@ curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X OPTIONS http://127.0.0.1:808
 
 ## Full curl test sequence
 
-All commands assume `WEBDAV_USERNAME=your-username` and the test password `YOUR_WEBDAV_PASSWORD`. Replace if you used different creds.
+All authenticated commands use the `WEBDAV_USERNAME` and `WEBDAV_PASSWORD` shell variables set above.
 
 **A note on XML formatting.** Git-bash on Windows does not ship `xmllint`. Either install it (`pacman -S libxml2` in MSYS2, `choco install xmlstarlet` then substitute `xmlstarlet fo`), pretty-print with Python (`python -c "import sys,xml.dom.minidom as m; print(m.parseString(sys.stdin.read()).toprettyxml())"`), or just read the raw XML — these responses are short. The runbook below pipes to `head -50` and uses `grep` so it works on a vanilla MSYS2 install.
 
@@ -92,7 +100,7 @@ time curl -i -X OPTIONS 'http://127.0.0.1:8080/dav/'
 **2. OPTIONS with auth → 200**
 
 ```bash
-curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X OPTIONS 'http://127.0.0.1:8080/dav/'
+curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X OPTIONS 'http://127.0.0.1:8080/dav/'
 ```
 
 **expect:** see the smoke test above.
@@ -100,7 +108,7 @@ curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X OPTIONS 'http://127.0.0.1:80
 **3. PROPFIND Depth: 0 on /dav/ → 207**
 
 ```bash
-curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 0' \
+curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPFIND -H 'Depth: 0' \
   -H 'Content-Type: application/xml' 'http://127.0.0.1:8080/dav/'
 ```
 
@@ -109,7 +117,7 @@ curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 0' \
 **4. PROPFIND Depth: 1 on /dav/ → 207, lists library/**
 
 ```bash
-curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 1' \
+curl -s -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPFIND -H 'Depth: 1' \
   'http://127.0.0.1:8080/dav/' | grep -oE '<(D:)?href>[^<]+</(D:)?href>'
 ```
 
@@ -118,7 +126,7 @@ curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 1' \
 **5. PROPFIND Depth: 1 on /dav/library/ → 207, lists pages**
 
 ```bash
-curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 1' \
+curl -s -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPFIND -H 'Depth: 1' \
   'http://127.0.0.1:8080/dav/library/' | grep -oE '<(D:)?href>[^<]+</(D:)?href>'
 ```
 
@@ -127,7 +135,7 @@ curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 1' \
 **6. PROPFIND Depth: 1 on /dav/library/recent/ → 207, files with sizes**
 
 ```bash
-curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 1' \
+curl -s -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPFIND -H 'Depth: 1' \
   'http://127.0.0.1:8080/dav/library/recent/' | head -80
 ```
 
@@ -136,11 +144,11 @@ curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 1' \
 **7. HEAD on a file → headers only**
 
 ```bash
-FNAME=$(curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 1' \
+FNAME=$(curl -s -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPFIND -H 'Depth: 1' \
   'http://127.0.0.1:8080/dav/library/recent/' \
   | grep -oE '<(D:)?href>[^<]+</(D:)?href>' | sed -n '2p' | sed -E 's|</?[^>]+>||g')
 [ -z "$FNAME" ] && { echo 'no items in recent/'; exit 1; }
-curl -sI -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} "http://127.0.0.1:8080${FNAME}"
+curl -sI -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" "http://127.0.0.1:8080${FNAME}"
 ```
 
 **expect:** `200 OK`, `Content-Length: <bytes>`, `Content-Type: image/jpeg` (or video/etc.). Note `-I` (not `-X HEAD`) — `curl -X HEAD` waits for a body that never comes and hangs.
@@ -151,7 +159,7 @@ This is the only round-trip that proves bytes survive end-to-end. Save a known f
 
 ```bash
 sha1sum ./smoke.jpg
-MSYS_NO_PATHCONV=1 curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} \
+MSYS_NO_PATHCONV=1 curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" \
   --upload-file ./smoke.jpg \
   'http://127.0.0.1:8080/dav/library/recent/upload-smoke.jpg'
 ```
@@ -161,7 +169,7 @@ MSYS_NO_PATHCONV=1 curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} \
 **9. Find the uploaded file in the listing**
 
 ```bash
-UPLOAD_HREF=$(curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 1' \
+UPLOAD_HREF=$(curl -s -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPFIND -H 'Depth: 1' \
   'http://127.0.0.1:8080/dav/library/recent/' \
   | grep -oE '<(D:)?href>[^<]+upload-smoke[^<]*</(D:)?href>' \
   | head -1 | sed -E 's|</?[^>]+>||g')
@@ -173,7 +181,7 @@ echo "found at: $UPLOAD_HREF"
 **10. GET it back and compare bytes**
 
 ```bash
-curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -o /tmp/dav-fetch.bin "http://127.0.0.1:8080${UPLOAD_HREF}"
+curl -s -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -o /tmp/dav-fetch.bin "http://127.0.0.1:8080${UPLOAD_HREF}"
 sha1sum /tmp/dav-fetch.bin ./smoke.jpg
 ```
 
@@ -182,7 +190,7 @@ sha1sum /tmp/dav-fetch.bin ./smoke.jpg
 **11. PROPFIND Depth: 0 on the file (not a directory) → 207**
 
 ```bash
-curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 0' \
+curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPFIND -H 'Depth: 0' \
   "http://127.0.0.1:8080${UPLOAD_HREF}"
 ```
 
@@ -193,7 +201,7 @@ curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 0' \
 > *This trashes only the file you just uploaded; the real library is untouched.*
 
 ```bash
-curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X DELETE "http://127.0.0.1:8080${UPLOAD_HREF}"
+curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X DELETE "http://127.0.0.1:8080${UPLOAD_HREF}"
 ```
 
 **expect:** `204 No Content`. Item moves to Google Photos trash (60-day retention). If you get 404, the file was indexed into a page other than what `$UPLOAD_HREF` points to — re-run step 9.
@@ -201,7 +209,7 @@ curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X DELETE "http://127.0.0.1:808
 **13. MKCOL → 403 (collections are virtual)**
 
 ```bash
-curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X MKCOL 'http://127.0.0.1:8080/dav/library/newdir/'
+curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X MKCOL 'http://127.0.0.1:8080/dav/library/newdir/'
 ```
 
 **expect:** `403 Forbidden`, body literally `collections are read-only\n` (LF byte), `Content-Type: text/plain; charset=utf-8`. This is gpix's `serve()` override (`server.go:51-55`) — x/net/webdav alone would return 405.
@@ -211,13 +219,13 @@ curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X MKCOL 'http://127.0.0.1:8080
 Mac Finder issues LOCK on every upload, so we verify it works:
 
 ```bash
-LOCK_RESP=$(curl -s -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X LOCK \
+LOCK_RESP=$(curl -s -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X LOCK \
   -H 'Content-Type: application/xml' -H 'Timeout: Second-60' \
   -d '<?xml version="1.0"?><d:lockinfo xmlns:d="DAV:"><d:lockscope><d:exclusive/></d:lockscope><d:locktype><d:write/></d:locktype><d:owner>test</d:owner></d:lockinfo>' \
   'http://127.0.0.1:8080/dav/library/recent/locktest.txt')
 echo "$LOCK_RESP" | head -20
 TOKEN=$(echo "$LOCK_RESP" | grep -i '^Lock-Token:' | sed -E 's/.*<([^>]+)>.*/\1/' | tr -d '\r')
-curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X UNLOCK \
+curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X UNLOCK \
   -H "Lock-Token: <$TOKEN>" 'http://127.0.0.1:8080/dav/library/recent/locktest.txt'
 ```
 
@@ -226,13 +234,13 @@ curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X UNLOCK \
 **15. PROPPATCH / COPY / MOVE — what actually happens**
 
 ```bash
-curl -sI -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPPATCH 'http://127.0.0.1:8080/dav/library/recent/' \
+curl -sI -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPPATCH 'http://127.0.0.1:8080/dav/library/recent/' \
   -H 'Content-Type: application/xml' \
   -d '<?xml version="1.0"?><d:propertyupdate xmlns:d="DAV:"><d:set><d:prop><d:displayname>x</d:displayname></d:prop></d:set></d:propertyupdate>' \
   -o /dev/null -w '%{http_code}\n'
-curl -sI -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X COPY 'http://127.0.0.1:8080/dav/library/recent/' \
+curl -sI -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X COPY 'http://127.0.0.1:8080/dav/library/recent/' \
   -H 'Destination: http://127.0.0.1:8080/dav/library/copy/' -o /dev/null -w '%{http_code}\n'
-curl -sI -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X MOVE 'http://127.0.0.1:8080/dav/library/recent/' \
+curl -sI -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X MOVE 'http://127.0.0.1:8080/dav/library/recent/' \
   -H 'Destination: http://127.0.0.1:8080/dav/library/moved/' -o /dev/null -w '%{http_code}\n'
 ```
 
@@ -241,8 +249,8 @@ curl -sI -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X MOVE 'http://127.0.0.1:8080
 **16. PROPFIND with bad path → 404**
 
 ```bash
-curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 0' 'http://127.0.0.1:8080/dav/library/recent/no-such-file.jpg'
-curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 0' 'http://127.0.0.1:8080/dav/foo/'
+curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPFIND -H 'Depth: 0' 'http://127.0.0.1:8080/dav/library/recent/no-such-file.jpg'
+curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPFIND -H 'Depth: 0' 'http://127.0.0.1:8080/dav/foo/'
 ```
 
 **expect:** `404 Not Found` for both.
@@ -252,7 +260,8 @@ curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 0' 'http
 > *Each wrong-cred attempt blocks for ≥ 300 ms on the server (`auth.go:24`); there's no runtime knob to disable it. Batch these at the end and budget ~3 s for 10 attempts.*
 
 ```bash
-time curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X OPTIONS 'http://127.0.0.1:8080/dav/'
+WEBDAV_WRONG_PASSWORD="${WEBDAV_PASSWORD}-intentionally-wrong"
+time curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_WRONG_PASSWORD}" -X OPTIONS 'http://127.0.0.1:8080/dav/'
 ```
 
 **expect:** `401`, body `unauthorized\n`, `real >= 0.3s` (may be higher on slow networks — the 300 ms is server-side only). Wrong username produces an identical response and timing.
@@ -269,14 +278,14 @@ rm -f /tmp/gpix-dav-* /tmp/gpix-davup-* 2>/dev/null
 
 ```bash
 sha1sum ./report.pdf
-MSYS_NO_PATHCONV=1 curl -i -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} --upload-file ./report.pdf \
+MSYS_NO_PATHCONV=1 curl -i -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" --upload-file ./report.pdf \
   'http://127.0.0.1:8080/dav/library/recent/report.pdf'     # expect 201
 
-DISGUISED=$(curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 1' \
+DISGUISED=$(curl -s -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPFIND -H 'Depth: 1' \
   'http://127.0.0.1:8080/dav/library/recent/' \
   | grep -oE '<(D:)?href>[^<]+report\.pdf[^<]*</(D:)?href>' \
   | head -1 | sed -E 's|</?[^>]+>||g')
-curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -o /tmp/report-back.pdf "http://127.0.0.1:8080${DISGUISED}"
+curl -s -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -o /tmp/report-back.pdf "http://127.0.0.1:8080${DISGUISED}"
 sha1sum /tmp/report-back.pdf ./report.pdf
 ls /tmp/gpix-dav-*   # one temp file populated by extractToTemp
 ```
@@ -286,7 +295,7 @@ ls /tmp/gpix-dav-*   # one temp file populated by extractToTemp
 **V1 (unencrypted disguise) — auto-extracts with NO env required.** Restart gpix with `WEBDAV_ENC_PASSPHRASE` commented out, then GET a known V1 disguised file (one uploaded before encryption was enabled, or via a gpix build that used plain disguise):
 
 ```bash
-curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -o /tmp/v1-back.bin "http://127.0.0.1:8080${V1_HREF}"
+curl -s -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -o /tmp/v1-back.bin "http://127.0.0.1:8080${V1_HREF}"
 sha1sum /tmp/v1-back.bin   # must match the original
 ```
 
@@ -304,7 +313,7 @@ Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\WebClient\Parame
 net stop webclient; net start webclient
 ```
 
-Then File Explorer → "Map network drive" → `http://127.0.0.1:8080/dav/` → enter `amarnath` / your password → drive Z appears. The `FileSizeLimitInBytes` tweak raises the WebClient cap to its documented maximum of ~4 GiB; the service cannot exceed that.
+Then File Explorer → "Map network drive" → `http://127.0.0.1:8080/dav/` → enter your configured username and password → drive Z appears. The `FileSizeLimitInBytes` tweak raises the WebClient cap to its documented maximum of ~4 GiB; the service cannot exceed that.
 
 **[WinFsp](https://winfsp.dev/) + [rclone](https://rclone.org/) (preferred):**
 
@@ -320,7 +329,7 @@ Finder → `Cmd+K` → `http://127.0.0.1:8080/dav/` → credentials. macOS Finde
 
 ```bash
 sudo apt install davfs2
-echo "/mnt/gpix amarnath YOUR_WEBDAV_PASSWORD" | sudo tee -a /etc/davfs2/secrets
+echo "/mnt/gpix ${WEBDAV_USERNAME} ${WEBDAV_PASSWORD}" | sudo tee -a /etc/davfs2/secrets
 sudo chmod 600 /etc/davfs2/secrets
 sudo mkdir -p /mnt/gpix
 sudo mount -t davfs http://127.0.0.1:8080/dav/ /mnt/gpix
@@ -335,8 +344,8 @@ ls /mnt/gpix/library/recent/
 rclone config create gpix webdav \
   url=http://127.0.0.1:8080/dav/ \
   vendor=other \
-  user=amarnath \
-  pass="$(rclone obscure 'YOUR_WEBDAV_PASSWORD')"
+  user="${WEBDAV_USERNAME}" \
+  pass="$(rclone obscure "${WEBDAV_PASSWORD}")"
 
 rclone ls gpix:library/recent
 rclone copy ./local.jpg gpix:library/recent/        # use recent/, NOT library/test/ — only recent and page-N exist
@@ -365,11 +374,11 @@ Discover-then-delete (avoid hardcoded placeholders):
 
 ```bash
 for NAME in upload-smoke report.pdf locktest.txt; do
-  HREF=$(curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X PROPFIND -H 'Depth: 1' \
+  HREF=$(curl -s -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X PROPFIND -H 'Depth: 1' \
     'http://127.0.0.1:8080/dav/library/recent/' \
     | grep -oE "<(D:)?href>[^<]+${NAME}[^<]*</(D:)?href>" \
     | head -1 | sed -E 's|</?[^>]+>||g')
-  [ -n "$HREF" ] && curl -s -u ${WEBDAV_USERNAME}:${WEBDAV_PASSWORD} -X DELETE "http://127.0.0.1:8080${HREF}" -w "deleted %{http_code} ${HREF}\n"
+  [ -n "$HREF" ] && curl -s -u "${WEBDAV_USERNAME}:${WEBDAV_PASSWORD}" -X DELETE "http://127.0.0.1:8080${HREF}" -w "deleted %{http_code} ${HREF}\n"
 done
 rm -f /tmp/gpix-dav-* /tmp/gpix-davup-* /tmp/dav-fetch.bin /tmp/report-back.pdf
 ```

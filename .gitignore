@@ -47,3 +47,8 @@ vendor/
 /go-test*.jpg
 /*.mp4
 /libstate*.bin
+
+# Standalone Vercel hoster & tools
+/vercel-hoster/
+.code-review-graph/
+

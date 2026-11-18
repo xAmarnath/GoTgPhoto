@@ -2,8 +2,13 @@ package gpmc
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
+
+	"google.golang.org/protobuf/proto"
+
+	pb "gpix/pkg/gpmc/gpmcpb"
 )
 
 // Album records and per-item album membership are buried inside the same
@@ -49,12 +54,45 @@ type rawSyncSnapshot struct {
 }
 
 type syncCache struct {
-	mu    sync.Mutex
-	at    time.Time
-	snap  *rawSyncSnapshot
+	mu   sync.Mutex
+	at   time.Time
+	snap *rawSyncSnapshot
 }
 
 const syncCacheTTL = 60 * time.Second
+
+func (c *Client) InvalidateSyncCache() {
+	c.syncMu.Lock()
+	c.sync = nil
+	c.syncMu.Unlock()
+}
+
+func (c *Client) ListAllItems(ctx context.Context) ([]MediaItem, error) {
+	snap, err := c.getSync(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]MediaItem, 0, len(snap.itemsByKey))
+	for _, it := range snap.itemsByKey {
+		out = append(out, it)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].Mtime.Equal(out[j].Mtime) {
+			return out[i].Mtime.After(out[j].Mtime)
+		}
+		return out[i].MediaKey < out[j].MediaKey
+	})
+	return out, nil
+}
+
+func (c *Client) GetItem(ctx context.Context, mediaKey string) (MediaItem, bool, error) {
+	snap, err := c.getSync(ctx)
+	if err != nil {
+		return MediaItem{}, false, err
+	}
+	it, ok := snap.itemsByKey[mediaKey]
+	return it, ok, nil
+}
 
 func (c *Client) getSync(ctx context.Context) (*rawSyncSnapshot, error) {
 	c.syncMu.Lock()
@@ -82,7 +120,8 @@ func (c *Client) fetchSync(ctx context.Context) (*rawSyncSnapshot, error) {
 		itemsByKey:  map[string]MediaItem{},
 	}
 	cursor := ""
-	for i := 0; i < maxAlbumScanPages; i++ {
+	emptyRun := 0
+	for range maxAlbumScanPages {
 		body, err := buildLibStateRequest(cursor)
 		if err != nil {
 			return snap, err
@@ -92,12 +131,26 @@ func (c *Client) fetchSync(ctx context.Context) (*rawSyncSnapshot, error) {
 			return snap, err
 		}
 
+		pageCount := 0
+		resp := &pb.LibStateResponse{}
+		if err := proto.Unmarshal(respBytes, resp); err == nil {
+			decoded := decodeMediaItems(resp.GetBody().GetItems())
+			pageCount += len(decoded)
+			for _, it := range decoded {
+				if it.MediaKey != "" {
+					snap.itemsByKey[it.MediaKey] = it
+				}
+			}
+		}
+
 		bodyBytes, ok := findFieldBytes(respBytes, 1)
 		if !ok {
 			break
 		}
 
-		for _, rec := range findAllFields(bodyBytes, 3) {
+		albumRecs := findAllFields(bodyBytes, 3)
+		pageCount += len(albumRecs)
+		for _, rec := range albumRecs {
 			a := parseAlbumRecord(rec)
 			if a.MediaKey != "" {
 				snap.albums = append(snap.albums, a)
@@ -122,6 +175,15 @@ func (c *Client) fetchSync(ctx context.Context) (*rawSyncSnapshot, error) {
 		if next == "" || next == cursor {
 			snap.syncToken = next
 			break
+		}
+		if pageCount == 0 {
+			emptyRun++
+			if emptyRun >= 2 {
+				snap.syncToken = next
+				break
+			}
+		} else {
+			emptyRun = 0
 		}
 		cursor = next
 		snap.syncToken = next

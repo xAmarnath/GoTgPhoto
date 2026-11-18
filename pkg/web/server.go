@@ -10,9 +10,13 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
+	"gpix/pkg/bridge"
+	"gpix/pkg/fusefs"
 	"gpix/pkg/gpmc"
+	"gpix/pkg/vfs"
 )
 
 //go:embed templates/*.html templates/partials/*.html
@@ -21,9 +25,24 @@ var tmplFS embed.FS
 //go:embed static
 var staticFS embed.FS
 
+type RuntimeHooks struct {
+	VFS           *vfs.FS
+	GetBot        func() *bridge.Bot
+	GetFUSEStatus func() fusefs.Status
+	RemountFUSE   func(mountPoint string, allowOther bool) error
+	UnmountFUSE   func() error
+	UpdateRuntime func(updates map[string]string) error
+	EnvFilePath   string
+	TrustLoopback bool
+}
+
 type Server struct {
+	mu             sync.RWMutex
 	cfg            Config
 	gp             *gpmc.Client
+	vfs            *vfs.FS
+	hooks          RuntimeHooks
+	jobs           *jobManager
 	log            *slog.Logger
 	httpSrv        *http.Server
 	urlCache       *urlCache
@@ -33,6 +52,38 @@ type Server struct {
 	tempSemaphore  chan struct{}
 	pageTmpls      map[string]*template.Template
 	extraMounts    map[string]http.Handler
+}
+
+func (s *Server) SetHooks(h RuntimeHooks) {
+	s.mu.Lock()
+	s.hooks = h
+	if h.VFS != nil {
+		s.vfs = h.VFS
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) SetClient(gp *gpmc.Client) {
+	s.mu.Lock()
+	s.gp = gp
+	s.urlCache = newURLCache(gp)
+	if s.vfs != nil {
+		s.vfs.SetClient(gp)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) client() *gpmc.Client {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.gp
+}
+
+func (s *Server) vfsInstance() *vfs.FS {
+	s.mu.RLock()
+	v := s.vfs
+	s.mu.RUnlock()
+	return v
 }
 
 func (s *Server) Mount(prefix string, h http.Handler) {
@@ -49,9 +100,18 @@ func New(cfg Config, gp *gpmc.Client, log *slog.Logger) (*Server, error) {
 	if len(cfg.SecretKey) < 32 {
 		return nil, errors.New("web: SecretKey must be at least 32 bytes")
 	}
+	defaultVFS, err := vfs.New(gp, vfs.Config{
+		TempDir:       cfg.TempDir,
+		EncPassphrase: os.Getenv("GPIX_ENC_PASSPHRASE"),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("web: init vfs: %w", err)
+	}
 	s := &Server{
 		cfg:            cfg,
 		gp:             gp,
+		vfs:            defaultVFS,
+		jobs:           newJobManager(),
 		log:            log,
 		urlCache:       newURLCache(gp),
 		progressBus:    newProgressBus(),

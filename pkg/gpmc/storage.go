@@ -14,9 +14,20 @@ import (
 )
 
 type StorageQuota struct {
-	UsageBytes int64
-	LimitBytes int64
-	Unlimited  bool
+	UsageBytes       int64 `json:"usageBytes"`
+	LimitBytes       int64 `json:"limitBytes"`
+	PhotosUsageBytes int64 `json:"photosUsageBytes"`
+	Unlimited        bool  `json:"unlimited"`
+}
+
+func (q StorageQuota) AvailableBytes() int64 {
+	if q.Unlimited || q.LimitBytes <= 0 {
+		return 0
+	}
+	if q.UsageBytes >= q.LimitBytes {
+		return 0
+	}
+	return q.LimitBytes - q.UsageBytes
 }
 
 type driveTokenCache struct {
@@ -26,6 +37,39 @@ type driveTokenCache struct {
 }
 
 func (c *Client) GetStorageQuota(ctx context.Context) (StorageQuota, error) {
+	if q, err := c.readPhotosStorageQuota(ctx); err == nil {
+		return q, nil
+	}
+	return c.readDriveStorageQuota(ctx)
+}
+
+func (c *Client) readPhotosStorageQuota(ctx context.Context) (StorageQuota, error) {
+	respBytes, err := c.doProto(ctx, "read-storage-quota", endpointReadStorageQuota, []byte{}, true, c.language)
+	if err != nil {
+		return StorageQuota{}, err
+	}
+	f1, ok := findFieldBytes(respBytes, 1)
+	if !ok {
+		return StorageQuota{}, fmt.Errorf("gpmc storage: missing quota payload")
+	}
+	var q StorageQuota
+	if v, ok := findFieldVarint(f1, 1); ok {
+		q.UsageBytes = int64(v)
+	}
+	if v, ok := findFieldVarint(f1, 2); ok {
+		q.LimitBytes = int64(v)
+	}
+	if v, ok := findFieldVarint(f1, 3); ok {
+		q.PhotosUsageBytes = int64(v)
+	}
+	if q.LimitBytes <= 0 || q.LimitBytes == ^int64(0) {
+		q.Unlimited = true
+		q.LimitBytes = 0
+	}
+	return q, nil
+}
+
+func (c *Client) readDriveStorageQuota(ctx context.Context) (StorageQuota, error) {
 	tok, err := c.driveBearer(ctx)
 	if err != nil {
 		return StorageQuota{}, fmt.Errorf("gpmc storage: get drive token: %w", err)

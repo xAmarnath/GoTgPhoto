@@ -28,6 +28,8 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/albums/add", s.requireSession(s.handleAlbumAdd))
 	mux.HandleFunc("GET /api/upload-progress/{id}", s.requireSession(s.handleProgressSSE))
 
+	s.registerAPIV1(mux)
+
 	mux.HandleFunc("GET /stream/{token}", s.handleStream)
 	mux.HandleFunc("GET /raw/{token}", s.handleRaw)
 

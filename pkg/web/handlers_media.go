@@ -1,8 +1,8 @@
 package web
 
 import (
-	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -16,7 +16,10 @@ import (
 )
 
 func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
-	key := r.PathValue("key")
+	s.serveThumbByKey(w, r, r.PathValue("key"))
+}
+
+func (s *Server) serveThumbByKey(w http.ResponseWriter, r *http.Request, key string) {
 	if key == "" {
 		http.NotFound(w, r)
 		return
@@ -34,7 +37,8 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := withTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 
-	tok, err := s.gp.BearerToken(ctx)
+	gp := s.client()
+	tok, err := gp.BearerToken(ctx)
 	if err != nil {
 		http.Error(w, "bearer: "+err.Error(), 500)
 		return
@@ -46,7 +50,7 @@ func (s *Server) handleThumb(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
-	resp, err := s.gp.HTTPClient().Do(req)
+	resp, err := gp.HTTPClient().Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), 502)
 		return
@@ -69,34 +73,39 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad token", http.StatusForbidden)
 		return
 	}
-	ctx, cancel := withTimeout(r.Context(), 30*time.Second)
-	defer cancel()
+	s.serveStreamByKey(w, r, key)
+}
 
-	manifest, err := s.gp.GetStreamManifest(ctx, key, "hls")
-	if err != nil {
-		s.proxyDownload(w, r, key, false)
-		return
-	}
-
+func (s *Server) serveStreamByKey(w http.ResponseWriter, r *http.Request, key string) {
+	mode := r.URL.Query().Get("mode")
 	levelQ := r.URL.Query().Get("level")
-	if levelQ != "" {
-		idx, perr := strconv.Atoi(levelQ)
-		if perr == nil {
-			variants := ParseMasterPlaylist(manifest)
-			for _, v := range variants {
-				if v.Index == idx {
-					http.Redirect(w, r, v.PlaylistURL, http.StatusFound)
-					return
+	if mode == "hls" || levelQ != "" {
+		ctx, cancel := withTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		gp := s.client()
+		manifest, err := gp.GetStreamManifest(ctx, key, "hls")
+		if err == nil {
+			if levelQ != "" {
+				idx, perr := strconv.Atoi(levelQ)
+				if perr == nil {
+					variants := ParseMasterPlaylist(manifest)
+					for _, v := range variants {
+						if v.Index == idx {
+							http.Redirect(w, r, v.PlaylistURL, http.StatusFound)
+							return
+						}
+					}
 				}
+				http.Error(w, "unknown level", http.StatusBadRequest)
+				return
 			}
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			w.Header().Set("Cache-Control", "private, max-age=300")
+			_, _ = io.WriteString(w, manifest)
+			return
 		}
-		http.Error(w, "unknown level", http.StatusBadRequest)
-		return
 	}
-
-	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-	w.Header().Set("Cache-Control", "private, max-age=300")
-	_, _ = io.WriteString(w, manifest)
+	s.serveRangeMedia(w, r, key, false)
 }
 
 func (s *Server) handleRaw(w http.ResponseWriter, r *http.Request) {
@@ -105,88 +114,119 @@ func (s *Server) handleRaw(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad token", http.StatusForbidden)
 		return
 	}
-	s.proxyDownload(w, r, key, true)
+	s.serveRangeMedia(w, r, key, true)
 }
 
-func (s *Server) proxyDownload(w http.ResponseWriter, r *http.Request, mediaKey string, attachment bool) {
-	ctx, cancel := withTimeout(r.Context(), 5*time.Minute)
+// serveRangeMedia serves any mediaKey (native, disguised V1, or encrypted V2) with full RFC 9110
+// HTTP Range (206 Partial Content) support via pkg/vfs's block-cached SeekableReader.
+func (s *Server) serveRangeMedia(w http.ResponseWriter, r *http.Request, mediaKey string, attachment bool) {
+	rc := http.NewResponseController(w)
+	_ = rc.SetWriteDeadline(time.Time{})
+
+	ctx := r.Context()
+	gp := s.client()
+	v := s.vfsInstance()
+
+	it, found, _ := gp.GetItem(ctx, mediaKey)
+	if !found {
+		it = gpmc.MediaItem{MediaKey: mediaKey}
+	}
+
+	pw := r.URL.Query().Get("passphrase")
+	sr, err := v.OpenReader(ctx, it, pw)
+	if err != nil {
+		if errors.Is(err, disguise.ErrEncrypted) {
+			writeJSONError(w, http.StatusLocked, "file is encrypted; passphrase required")
+			return
+		}
+		if errors.Is(err, disguise.ErrWrongPassphrase) {
+			writeJSONError(w, http.StatusForbidden, "wrong decryption passphrase")
+			return
+		}
+		http.Error(w, "open media: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer sr.Close()
+
+	name := sr.Name()
+	if name == "" {
+		name = mediaKey
+	}
+	contentType := disguiseMIME(name)
+	if contentType == "application/octet-stream" && !sr.IsDisguised() {
+		switch it.Kind {
+		case gpmc.KindVideo:
+			contentType = "video/mp4"
+		case gpmc.KindPhoto:
+			contentType = "image/jpeg"
+		}
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	dispType := "inline"
+	if attachment {
+		dispType = "attachment"
+	}
+	if disp := mime.FormatMediaType(dispType, map[string]string{"filename": name}); disp != "" {
+		w.Header().Set("Content-Disposition", disp)
+	}
+
+	if sr.Size() > 0 {
+		http.ServeContent(w, r, name, sr.ModTime(), sr)
+		return
+	}
+
+	s.proxyDownloadFallback(w, r, mediaKey, attachment)
+}
+
+func (s *Server) proxyDownloadFallback(w http.ResponseWriter, r *http.Request, mediaKey string, attachment bool) {
+	ctx, cancel := withTimeout(r.Context(), 15*time.Minute)
 	defer cancel()
 
-	url, err := s.urlCache.Get(ctx, mediaKey)
+	dlURL, err := s.urlCache.Get(ctx, mediaKey)
 	if err != nil {
 		http.Error(w, "resolve: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	resp, retried, err := s.doProxyGet(ctx, url, mediaKey, false)
+	req, err := http.NewRequestWithContext(ctx, r.Method, dlURL, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if rng := r.Header.Get("Range"); rng != "" {
+		req.Header.Set("Range", rng)
+	}
+	resp, err := s.client().HTTPClient().Do(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
-	if (resp.StatusCode == 403 || resp.StatusCode == 410) && !retried {
-		resp.Body.Close()
-		s.urlCache.Invalidate(mediaKey)
-		url, err = s.urlCache.Get(ctx, mediaKey)
-		if err != nil {
-			http.Error(w, "re-resolve: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-		resp, _, err = s.doProxyGet(ctx, url, mediaKey, true)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-	}
 
-	br := bufio.NewReaderSize(resp.Body, 64*1024)
-	if attachment && resp.StatusCode == http.StatusOK {
-		head, _ := br.Peek(8192)
-		if disguise.LooksDisguised(head) {
-			hdr, payload, err := disguise.Extract(br)
-			if err == nil {
-				origName := hdr.Filename
-				if origName == "" {
-					origName = "download.bin"
-				}
-				w.Header().Set("Content-Type", disguiseMIME(origName))
-				w.Header().Set("Content-Length", strconv.FormatInt(hdr.PayloadSize, 10))
-				disp := mime.FormatMediaType("attachment", map[string]string{"filename": origName})
-				if disp == "" {
-					disp = `attachment; filename="` + origName + `"`
-				}
-				w.Header().Set("Content-Disposition", disp)
-				w.WriteHeader(http.StatusOK)
-				_, _ = io.Copy(w, payload)
-				return
-			}
+	for _, h := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"} {
+		if hv := resp.Header.Get(h); hv != "" {
+			w.Header().Set(h, hv)
 		}
 	}
-
-	for _, h := range []string{"Content-Type", "Content-Length"} {
-		if v := resp.Header.Get(h); v != "" {
-			w.Header().Set(h, v)
-		}
-	}
-	if attachment {
-		if cd := resp.Header.Get("Content-Disposition"); cd != "" {
-			w.Header().Set("Content-Disposition", cd)
-		} else {
-			w.Header().Set("Content-Disposition", "attachment")
-		}
+	if attachment && w.Header().Get("Content-Disposition") == "" {
+		w.Header().Set("Content-Disposition", "attachment")
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, br)
+	if r.Method != http.MethodHead {
+		_, _ = io.Copy(w, resp.Body)
+	}
 }
 
 func disguiseMIME(filename string) string {
 	if filename == "" {
 		return "application/octet-stream"
 	}
-	if m := mime.TypeByExtension(filepath.Ext(filename)); m != "" {
+	ext := filepath.Ext(filename)
+	if m := mime.TypeByExtension(ext); m != "" {
 		return m
 	}
-	return "application/octet-stream"
+	return disguise.MIMEForFilename(filename)
 }
 
 func (s *Server) doProxyGet(ctx context.Context, url, mediaKey string, _ bool) (*http.Response, bool, error) {
@@ -194,10 +234,10 @@ func (s *Server) doProxyGet(ctx context.Context, url, mediaKey string, _ bool) (
 	if err != nil {
 		return nil, false, err
 	}
-	resp, err := s.gp.HTTPClient().Do(req)
+	resp, err := s.client().HTTPClient().Do(req)
 	return resp, false, err
 }
 
-func withTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(parent, d)
+func withTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, d)
 }

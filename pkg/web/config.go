@@ -78,7 +78,11 @@ func LoadConfig(path string) (Config, error) {
 		return cfg, errors.New("config: password_hash is required")
 	}
 	if cfg.TempDir == "" {
-		cfg.TempDir = os.TempDir()
+		if envTmp := os.Getenv("GPIX_TEMP_DIR"); envTmp != "" {
+			cfg.TempDir = envTmp
+		} else {
+			cfg.TempDir = os.TempDir()
+		}
 	}
 	return cfg, nil
 }

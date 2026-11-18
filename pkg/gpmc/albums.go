@@ -96,6 +96,7 @@ func (c *Client) CreateAlbum(ctx context.Context, title string, mediaKeys []stri
 	if !ok || key == "" {
 		return "", fmt.Errorf("gpmc create-album: response missing album media_key")
 	}
+	c.InvalidateSyncCache()
 	return key, nil
 }
 
@@ -125,6 +126,9 @@ func (c *Client) AddMediaToAlbum(ctx context.Context, albumMediaKey string, medi
 	body = encInt(body, 7, time.Now().Unix())
 
 	_, err := c.doProto(ctx, "add-to-album", endpointAddMediaToAlbum, body, true, "")
+	if err == nil {
+		c.InvalidateSyncCache()
+	}
 	return err
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/amarnathcjd/gogram/telegram"
 
@@ -12,14 +13,18 @@ import (
 )
 
 type Bot struct {
-	tg      *telegram.Client
-	gp      *gpmc.Client
-	owner   int64
-	xfer    *Transfer
-	log     *slog.Logger
-	ctx     context.Context
-	tempDir string
-	queue   *uploadQueue
+	tg          *telegram.Client
+	gp          *gpmc.Client
+	owner       int64
+	xfer        *Transfer
+	log         *slog.Logger
+	ctx         context.Context
+	tempDir     string
+	queue       *uploadQueue
+	botUsername string
+	botID       int64
+	proxyDesc   string
+	autoUpload  bool
 }
 
 func New(cfg Config, gp *gpmc.Client, log *slog.Logger) (*Bot, error) {
@@ -47,12 +52,9 @@ func New(cfg Config, gp *gpmc.Client, log *slog.Logger) (*Bot, error) {
 			"port", cfg.Proxy.GetPort(),
 		)
 	}
-	tg, err := telegram.NewClient(tgCfg)
+	tg, err := connectTelegramWithFallback(tgCfg, cfg.BotToken, log)
 	if err != nil {
-		return nil, fmt.Errorf("bridge: telegram.NewClient: %w", err)
-	}
-	if err := tg.LoginBot(cfg.BotToken); err != nil {
-		return nil, fmt.Errorf("bridge: LoginBot: %w", err)
+		return nil, err
 	}
 
 	b := &Bot{
@@ -63,6 +65,13 @@ func New(cfg Config, gp *gpmc.Client, log *slog.Logger) (*Bot, error) {
 		log:     log,
 		tempDir: cfg.TempDir,
 		queue:   &uploadQueue{},
+	}
+	if cfg.Proxy != nil {
+		b.proxyDesc = fmt.Sprintf("%s://%s:%d", cfg.Proxy.Type(), cfg.Proxy.GetHost(), cfg.Proxy.GetPort())
+	}
+	if me, err := tg.GetMe(); err == nil && me != nil {
+		b.botUsername = me.Username
+		b.botID = me.ID
 	}
 
 	tg.On("message:/upload", b.wrap(b.handleUpload))
@@ -89,6 +98,45 @@ func (b *Bot) Start(ctx context.Context) error {
 }
 
 func (b *Bot) Stop() error { return b.tg.Stop() }
+
+func connectTelegramWithFallback(tgCfg telegram.ClientConfig, botToken string, log *slog.Logger) (*telegram.Client, error) {
+	tryConnect := func(c telegram.ClientConfig) (*telegram.Client, error) {
+		type res struct {
+			cl  *telegram.Client
+			err error
+		}
+		ch := make(chan res, 1)
+		go func() {
+			cl, err := telegram.NewClient(c)
+			if err != nil {
+				ch <- res{err: fmt.Errorf("bridge: telegram.NewClient: %w", err)}
+				return
+			}
+			if err := cl.LoginBot(botToken); err != nil {
+				_ = cl.Stop()
+				ch <- res{err: fmt.Errorf("bridge: LoginBot: %w", err)}
+				return
+			}
+			ch <- res{cl: cl}
+		}()
+		select {
+		case r := <-ch:
+			return r.cl, r.err
+		case <-time.After(15 * time.Second):
+			return nil, errors.New("bridge: telegram login timed out after 15s")
+		}
+	}
+
+	cl, err := tryConnect(tgCfg)
+	if err == nil || tgCfg.Proxy == nil {
+		return cl, err
+	}
+	log.Warn("telegram proxy connection failed; retrying direct connection", "err", err)
+	directCfg := tgCfg
+	directCfg.Proxy = nil
+	directCfg.Session = tgCfg.Session + ".direct"
+	return tryConnect(directCfg)
+}
 
 func (b *Bot) wrap(fn func(*telegram.NewMessage) error) func(*telegram.NewMessage) error {
 	return func(m *telegram.NewMessage) (rerr error) {

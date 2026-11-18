@@ -87,6 +87,9 @@ func (c *Client) DeleteByMediaKeys(ctx context.Context, mediaKeys []string, perm
 	for k := range found {
 		results[k] = opErr
 	}
+	if opErr == nil {
+		c.InvalidateSyncCache()
+	}
 	return results, nil
 }
 

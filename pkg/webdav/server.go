@@ -3,10 +3,12 @@ package webdav
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"golang.org/x/net/webdav"
 
 	"gpix/pkg/gpmc"
+	"gpix/pkg/vfs"
 )
 
 const Prefix = "/dav"
@@ -14,18 +16,30 @@ const Prefix = "/dav"
 type Server struct {
 	cfg     Config
 	gp      *gpmc.Client
+	vfs     *vfs.FS
 	log     *slog.Logger
 	handler *webdav.Handler
 }
 
 func NewServer(cfg Config, gp *gpmc.Client, log *slog.Logger) (*Server, error) {
+	v, err := vfs.New(gp, vfs.Config{
+		EncPassphrase:    cfg.EncPassphrase,
+		StrictWebDAVRoot: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return NewServerWithVFS(cfg, v, log)
+}
+
+func NewServerWithVFS(cfg Config, v *vfs.FS, log *slog.Logger) (*Server, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{cfg: cfg, gp: gp, log: log}
+	s := &Server{cfg: cfg, gp: v.Client(), vfs: v, log: log}
 	s.handler = &webdav.Handler{
 		Prefix:     Prefix,
-		FileSystem: newFS(gp, cfg),
+		FileSystem: newFS(v, cfg),
 		LockSystem: webdav.NewMemLS(),
 		Logger: func(r *http.Request, err error) {
 			if err != nil {
@@ -49,10 +63,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	case "MKCOL":
-		// Collections are virtual; the x/net handler can only surface a 405
-		// for a rejected Mkdir, so answer 403 here per the gpix contract.
-		http.Error(w, "collections are read-only", http.StatusForbidden)
-		return
+		rel := strings.TrimPrefix(r.URL.Path, Prefix)
+		clean := vfs.CleanPath(rel)
+		parts := strings.Split(strings.TrimPrefix(clean, "/"), "/")
+		if !(len(parts) == 2 && parts[0] == "albums" && parts[1] != "") {
+			http.Error(w, "collections are read-only", http.StatusForbidden)
+			return
+		}
 	}
 	s.handler.ServeHTTP(w, r)
 }

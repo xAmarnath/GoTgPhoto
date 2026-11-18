@@ -2,13 +2,34 @@ package web
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"runtime/debug"
 	"time"
 )
 
+func (s *Server) isTrustedLoopback(r *http.Request) bool {
+	s.mu.RLock()
+	trust := s.hooks.TrustLoopback
+	s.mu.RUnlock()
+	if !trust {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func (s *Server) requireSession(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if s.isTrustedLoopback(r) {
+			ctx := context.WithValue(r.Context(), ctxKeyUser, s.cfg.Username)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
 		c, err := r.Cookie(sessionCookieName)
 		if err != nil {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
@@ -17,6 +38,28 @@ func (s *Server) requireSession(next http.HandlerFunc) http.HandlerFunc {
 		user, err := s.verifySession(c.Value)
 		if err != nil {
 			http.Redirect(w, r, "/login", http.StatusSeeOther)
+			return
+		}
+		ctx := context.WithValue(r.Context(), ctxKeyUser, user)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	}
+}
+
+func (s *Server) requireAPI(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.isTrustedLoopback(r) {
+			ctx := context.WithValue(r.Context(), ctxKeyUser, s.cfg.Username)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+		c, err := r.Cookie(sessionCookieName)
+		if err != nil {
+			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		user, err := s.verifySession(c.Value)
+		if err != nil {
+			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		ctx := context.WithValue(r.Context(), ctxKeyUser, user)

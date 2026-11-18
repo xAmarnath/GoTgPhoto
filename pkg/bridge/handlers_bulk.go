@@ -24,6 +24,24 @@ func (b *Bot) handleCatchMedia(m *telegram.NewMessage) error {
 		return nil
 	}
 	name := tgMediaName(m)
+	if b.AutoUpload() {
+		status, err := m.Reply(fmt.Sprintf("Auto-uploading %s to Google Photos…", name))
+		if err != nil {
+			return err
+		}
+		go func() {
+			pw := os.Getenv("GPIX_ENC_PASSPHRASE")
+			line, uerr := b.uploadOneFromTG(b.ctx, m, gpmc.QualityOriginal, pw, func(s string) {
+				_, _ = status.Edit(s)
+			})
+			if uerr != nil {
+				_, _ = status.Edit("Auto-upload failed: " + uerr.Error())
+				return
+			}
+			_, _ = status.Edit("Auto-uploaded · " + line)
+		}()
+		return nil
+	}
 	b.queue.Add(queuedItem{
 		ChatID:    m.ChatID(),
 		MessageID: m.ID,

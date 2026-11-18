@@ -155,6 +155,7 @@ func (c *Client) uploadOne(ctx context.Context, path string, opts UploadOpts, pr
 	}
 
 	res.MediaKey = key
+	c.InvalidateSyncCache()
 	emit(StageDone, size, size, nil)
 	if opts.DeleteAfter {
 		_ = os.Remove(path)

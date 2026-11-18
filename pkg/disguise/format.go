@@ -92,6 +92,30 @@ func ParseHeader(buf []byte) (Header, int, error) {
 	return Header{Filename: name, PayloadSize: int64(payloadSize)}, headerEnd, nil
 }
 
+func PeekMeta(head []byte) (version int, hdr Header, payloadOffset int, err error) {
+	v, idx := peekVersion(head)
+	if v == 0 {
+		return 0, Header{}, 0, ErrNotDisguised
+	}
+	if v == 1 {
+		h, end, err := ParseHeader(head)
+		return 1, h, end, err
+	}
+	rest := head[idx+MagicLen:]
+	if len(rest) < 4 {
+		return 2, Header{}, 0, ErrBadHeader
+	}
+	nameLen := readU32(rest[:4])
+	if nameLen > maxName || len(rest) < int(4+nameLen)+saltLen+nonceLen+8 {
+		return 2, Header{}, 0, ErrBadHeader
+	}
+	name := string(rest[4 : 4+nameLen])
+	off := 4 + int(nameLen) + saltLen + nonceLen
+	plainSize := readU64(rest[off : off+8])
+	headerEnd := idx + MagicLen + off + 8
+	return 2, Header{Filename: name, PayloadSize: int64(plainSize)}, headerEnd, nil
+}
+
 func Extract(r io.Reader) (Header, io.Reader, error) {
 	br := bufio.NewReaderSize(r, maxScan)
 	head, err := br.Peek(maxScan)

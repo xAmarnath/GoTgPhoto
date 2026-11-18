@@ -62,10 +62,15 @@ func (c *Client) CreateAlbum(ctx context.Context, title string, mediaKeys []stri
 	}
 	ts := time.Now().Unix()
 
+	mode := int64(1)
+	if len(mediaKeys) == 0 {
+		mode = 2
+	}
+
 	body := []byte{}
 	body = encString(body, 1, title)
 	body = encInt(body, 2, ts)
-	body = encInt(body, 3, 1)
+	body = encInt(body, 3, mode)
 	for _, k := range mediaKeys {
 		inner := encString(nil, 1, k)
 		entry := encSubMessage(nil, 1, inner)

@@ -192,7 +192,7 @@ func (s *Server) toFileDTO(it gpmc.MediaItem) fileDTO {
 
 	isDisguised := false
 	isEncrypted := false
-	if dm, ok := v.Meta().GetDisguise(it.MediaKey); ok && dm.Version > 0 {
+	if dm, ok := v.Meta().DisguiseFor(it.MediaKey, it.SHA1); ok && dm.Version > 0 {
 		isDisguised = true
 		isEncrypted = dm.Version == 2
 	} else if _, ok := disguise.LooksLikeDisguisedFilename(it.Filename); ok {
@@ -255,7 +255,7 @@ func (s *Server) handleV1Status(w http.ResponseWriter, r *http.Request) {
 		}
 		visibleCount++
 		totalLibBytes += v.LogicalSize(it)
-		if dm, ok := v.Meta().GetDisguise(it.MediaKey); (ok && dm.Version > 0) || hasDisguiseSuffix(it.Filename) {
+		if dm, ok := v.Meta().DisguiseFor(it.MediaKey, it.SHA1); (ok && dm.Version > 0) || hasDisguiseSuffix(it.Filename) {
 			disguisedCount++
 		}
 	}
@@ -1120,21 +1120,21 @@ func (s *Server) handleV1ConfigGet(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"envPath":            envPath,
-		"gpAuthConfigured":   gp.AuthData() != "",
-		"gpAuthMasked":       maskSecret(gp.AuthData()),
-		"gpEmail":            email,
-		"deviceProfile":      s.cfg.DeviceProfile,
-		"encPassphraseSet":   os.Getenv("GPIX_ENC_PASSPHRASE") != "",
-		"tgBotTokenSet":      os.Getenv("TG_BOT_TOKEN") != "",
-		"tgBotTokenMasked":   maskSecret(os.Getenv("TG_BOT_TOKEN")),
-		"tgApiId":            os.Getenv("TG_API_ID"),
-		"tgApiHashSet":       os.Getenv("TG_API_HASH") != "",
-		"tgOwnerId":          os.Getenv("TG_OWNER_ID"),
-		"tgProxy":            os.Getenv("TG_PROXY"),
-		"fuseMountPoint":     fuseSt.MountPoint,
-		"fuseAllowOther":     fuseSt.AllowOther,
-		"fuseMounted":        fuseSt.Mounted,
+		"envPath":          envPath,
+		"gpAuthConfigured": gp.AuthData() != "",
+		"gpAuthMasked":     maskSecret(gp.AuthData()),
+		"gpEmail":          email,
+		"deviceProfile":    s.cfg.DeviceProfile,
+		"encPassphraseSet": os.Getenv("GPIX_ENC_PASSPHRASE") != "",
+		"tgBotTokenSet":    os.Getenv("TG_BOT_TOKEN") != "",
+		"tgBotTokenMasked": maskSecret(os.Getenv("TG_BOT_TOKEN")),
+		"tgApiId":          os.Getenv("TG_API_ID"),
+		"tgApiHashSet":     os.Getenv("TG_API_HASH") != "",
+		"tgOwnerId":        os.Getenv("TG_OWNER_ID"),
+		"tgProxy":          os.Getenv("TG_PROXY"),
+		"fuseMountPoint":   fuseSt.MountPoint,
+		"fuseAllowOther":   fuseSt.AllowOther,
+		"fuseMounted":      fuseSt.Mounted,
 	})
 }
 

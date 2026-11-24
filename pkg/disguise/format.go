@@ -27,6 +27,13 @@ type Header struct {
 }
 
 func Wrap(name string, payload io.Reader, payloadSize int64) (io.Reader, int64) {
+	return WrapTail(name, payload, payloadSize, nil)
+}
+
+// WrapTail is Wrap plus trailing bytes after the payload. Readers stop at the recorded payload
+// size, so a random tail makes every upload unique: Google resolves identical content to the
+// first item with that hash, which fails to download once that item has been deleted.
+func WrapTail(name string, payload io.Reader, payloadSize int64, tail []byte) (io.Reader, int64) {
 	nameBytes := []byte(name)
 	hdr := bytes.NewBuffer(make([]byte, 0, MagicLen+4+len(nameBytes)+8))
 	hdr.WriteString(Magic)
@@ -34,11 +41,12 @@ func Wrap(name string, payload io.Reader, payloadSize int64) (io.Reader, int64) 
 	hdr.Write(nameBytes)
 	_ = binary.Write(hdr, binary.LittleEndian, uint64(payloadSize))
 
-	total := int64(len(wrapperMP4)) + int64(hdr.Len()) + payloadSize
+	total := int64(len(wrapperMP4)) + int64(hdr.Len()) + payloadSize + int64(len(tail))
 	r := io.MultiReader(
 		bytes.NewReader(wrapperMP4),
 		bytes.NewReader(hdr.Bytes()),
 		payload,
+		bytes.NewReader(tail),
 	)
 	return r, total
 }

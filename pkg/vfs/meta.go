@@ -1,6 +1,7 @@
 package vfs
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"hash/fnv"
 	"io/fs"
@@ -157,6 +158,33 @@ func (m *MetaStore) GetDisguise(mediaKey string) (DisguiseMeta, bool) {
 	defer m.mu.RUnlock()
 	d, ok := m.st.Disguise[mediaKey]
 	return d, ok && d.Checked
+}
+
+func shaAlias(sha []byte) string { return "sha1:" + hex.EncodeToString(sha) }
+
+// DisguiseFor looks up disguise metadata by media key, falling back to the content hash:
+// Google gives the album copy of an upload a different media key than the one the commit
+// returned, but the SHA-1 is identical.
+func (m *MetaStore) DisguiseFor(mediaKey string, sha []byte) (DisguiseMeta, bool) {
+	if d, ok := m.GetDisguise(mediaKey); ok {
+		return d, true
+	}
+	if len(sha) == 0 {
+		return DisguiseMeta{}, false
+	}
+	d, ok := m.GetDisguise(shaAlias(sha))
+	if ok && mediaKey != "" {
+		m.PutDisguise(mediaKey, d)
+	}
+	return d, ok
+}
+
+// PutDisguiseSHA records disguise metadata under the content hash as well as the media key.
+func (m *MetaStore) PutDisguiseSHA(mediaKey string, sha []byte, d DisguiseMeta) {
+	m.PutDisguise(mediaKey, d)
+	if len(sha) > 0 {
+		m.PutDisguise(shaAlias(sha), d)
+	}
 }
 
 func (m *MetaStore) PutDisguise(mediaKey string, d DisguiseMeta) {

@@ -28,6 +28,7 @@ const Supported = true
 // empty, non-existent directory path.
 type winHandle struct {
 	host       *fuse.FileSystemHost
+	g          *winFS
 	mountPoint string
 	done       chan struct{}
 	once       sync.Once
@@ -38,6 +39,7 @@ func (h *winHandle) MountPoint() string { return h.mountPoint }
 func (h *winHandle) Unmount() error {
 	var err error
 	h.once.Do(func() {
+		h.g.waitAllPending()
 		if !h.host.Unmount() {
 			err = errors.New("fusefs: winfsp unmount failed")
 		}
@@ -49,7 +51,7 @@ func mountOS(ctx context.Context, v *vfs.FS, opts Options) (Handle, error) {
 	if opts.MountPoint == "" {
 		return nil, errors.New("fusefs: mount point is required (e.g. X:)")
 	}
-	g := &winFS{v: v, handles: map[uint64]*lazyFile{}, ready: make(chan struct{}), dirs: map[string]*dirEntry{}, fresh: map[string]time.Time{}}
+	g := &winFS{v: v, handles: map[uint64]*lazyFile{}, ready: make(chan struct{}), dirs: map[string]*dirEntry{}, fresh: map[string]time.Time{}, pending: map[string]*pendingEntry{}}
 	host := fuse.NewFileSystemHost(g)
 	host.SetCapReaddirPlus(true)
 	host.SetCapDeleteAccess(true)
@@ -68,7 +70,7 @@ func mountOS(ctx context.Context, v *vfs.FS, opts Options) (Handle, error) {
 		args = append(args, "-d")
 	}
 
-	h := &winHandle{host: host, mountPoint: opts.MountPoint, done: make(chan struct{})}
+	h := &winHandle{host: host, g: g, mountPoint: opts.MountPoint, done: make(chan struct{})}
 	failed := make(chan struct{})
 	go func() {
 		if !host.Mount(opts.MountPoint, args) {
@@ -109,6 +111,8 @@ type winFS struct {
 	saving bool
 	dirs   map[string]*dirEntry
 	fresh  map[string]time.Time
+
+	pending map[string]*pendingEntry
 }
 
 // dirEntry is a cached directory listing. Per-file Lstat on the "all" and "library" views is
@@ -286,6 +290,8 @@ func (g *winFS) saveDiskCache() {
 
 // prewarm refreshes the top of the tree so the first Explorer open is already cached.
 func (g *winFS) prewarm() {
+	// The first library walk takes tens of seconds; start it before anything asks for it.
+	go func() { _, _, _ = g.v.Client().GetItem(g.ctx(), "") }()
 	for _, d := range []string{"/", "/albums", "/all", "/library"} {
 		if items, err := g.listDir(d); err == nil && d == "/library" {
 			for name, it := range items {
@@ -323,6 +329,9 @@ func (g *winFS) isFresh(p string) bool {
 }
 
 func (g *winFS) lstat(p string) (*vfs.NodeInfo, error) {
+	if ni := g.pendingInfo(p); ni != nil {
+		return ni, nil
+	}
 	if p == "/" || g.isFresh(p) {
 		return g.v.Lstat(g.ctx(), p)
 	}
@@ -346,6 +355,21 @@ func (g *winFS) Init() {
 }
 
 func (g *winFS) ctx() context.Context { return context.Background() }
+
+var traceOps = os.Getenv("GPIX_TRACE") != ""
+
+// trace logs filesystem calls slower than 500 ms when GPIX_TRACE is set.
+func trace(op, name string) func() {
+	if !traceOps {
+		return func() {}
+	}
+	t := time.Now()
+	return func() {
+		if d := time.Since(t); d > 500*time.Millisecond {
+			fmt.Fprintf(os.Stderr, "SLOW %s %s %v\n", op, name, d.Round(time.Millisecond))
+		}
+	}
+}
 
 func cp(name string) string { return vfs.CleanPath(strings.ReplaceAll(name, "\\", "/")) }
 
@@ -412,6 +436,8 @@ type lazyFile struct {
 
 	mu sync.Mutex
 	fh *vfs.FileHandle
+
+	written atomic.Bool
 }
 
 func (l *lazyFile) get() (*vfs.FileHandle, error) {
@@ -441,6 +467,7 @@ func (l *lazyFile) Size() int64 {
 }
 
 func (l *lazyFile) Truncate(n int64) error {
+	l.written.Store(true)
 	fh, err := l.get()
 	if err != nil {
 		return err
@@ -448,15 +475,36 @@ func (l *lazyFile) Truncate(n int64) error {
 	return fh.Truncate(n)
 }
 
+// ReadAt retries for a minute on freshly uploaded files: the backend needs a few seconds
+// before a new item can be downloaded.
 func (l *lazyFile) ReadAt(p []byte, off int64) (int, error) {
-	fh, err := l.get()
-	if err != nil {
-		return 0, err
+	var n int
+	var err error
+	for attempt := 0; ; attempt++ {
+		var fh *vfs.FileHandle
+		if fh, err = l.get(); err == nil {
+			if n, err = fh.ReadAt(p, off); err == nil || errors.Is(err, io.EOF) {
+				return n, err
+			}
+		}
+		if traceOps {
+			fmt.Fprintf(os.Stderr, "READERR %s attempt %d: %v\n", l.path, attempt, err)
+		}
+		if attempt >= 30 || !l.g.isFresh(l.path) {
+			return n, err
+		}
+		l.mu.Lock()
+		if l.fh != nil && !l.written.Load() {
+			_ = l.fh.Close()
+			l.fh = nil
+		}
+		l.mu.Unlock()
+		time.Sleep(2 * time.Second)
 	}
-	return fh.ReadAt(p, off)
 }
 
 func (l *lazyFile) WriteAt(p []byte, off int64) (int, error) {
+	l.written.Store(true)
 	fh, err := l.get()
 	if err != nil {
 		return 0, err
@@ -519,6 +567,7 @@ func (g *winFS) Statfs(_ string, st *fuse.Statfs_t) int {
 }
 
 func (g *winFS) Getattr(name string, st *fuse.Stat_t, fh uint64) int {
+	defer trace("Getattr", name)()
 	p := cp(name)
 	h := g.handle(fh)
 	ni, err := g.lstat(p)
@@ -548,6 +597,11 @@ func (g *winFS) Readdir(name string, fill func(string, *fuse.Stat_t, int64) bool
 	}
 	fill(".", nil, 0)
 	fill("..", nil, 0)
+	for _, it := range g.pendingIn(cp(name)) {
+		var st fuse.Stat_t
+		fillStat(it, &st)
+		fill(it.FileName, &st, 0)
+	}
 	for _, it := range items {
 		var st fuse.Stat_t
 		fillStat(it, &st)
@@ -558,7 +612,29 @@ func (g *winFS) Readdir(name string, fill func(string, *fuse.Stat_t, int64) bool
 	return 0
 }
 
+// goFlags converts WinFsp's msvcrt-style open flags to Go's: the two sets overlap with
+// different meanings (WinFsp O_EXCL is 0x400, Go's O_APPEND). Append is dropped because
+// WinFsp always sends explicit offsets.
+func goFlags(f int) int {
+	var o int
+	switch f & fuse.O_ACCMODE {
+	case fuse.O_WRONLY:
+		o = os.O_WRONLY
+	case fuse.O_RDWR:
+		o = os.O_RDWR
+	}
+	if f&fuse.O_TRUNC != 0 {
+		o |= os.O_TRUNC
+	}
+	if f&fuse.O_EXCL != 0 {
+		o |= os.O_EXCL
+	}
+	return o
+}
+
 func (g *winFS) Open(name string, flags int) (int, uint64) {
+	defer trace("Open", name)()
+	g.waitPending(cp(name))
 	p := cp(name)
 	ni, err := g.lstat(p)
 	if err != nil {
@@ -567,30 +643,37 @@ func (g *winFS) Open(name string, flags int) (int, uint64) {
 	if ni.IsDirFlag {
 		return 0, ^uint64(0)
 	}
+	gf := goFlags(flags)
 	if flags&(fuse.O_WRONLY|fuse.O_RDWR|fuse.O_TRUNC|fuse.O_APPEND) == 0 {
-		return 0, g.addHandle(&lazyFile{g: g, path: p, flags: flags, size: ni.FileSize})
+		return 0, g.addHandle(&lazyFile{g: g, path: p, flags: gf, size: ni.FileSize})
 	}
-	fh, err := g.v.OpenFile(g.ctx(), p, flags, 0o644)
+	fh, err := g.v.OpenFile(g.ctx(), p, gf, 0o644)
 	if err != nil {
 		return errc(err), ^uint64(0)
 	}
-	return 0, g.addHandle(&lazyFile{g: g, path: p, flags: flags, fh: fh})
+	return 0, g.addHandle(&lazyFile{g: g, path: p, flags: gf, fh: fh})
 }
 
 func (g *winFS) Create(name string, flags int, mode uint32) (int, uint64) {
+	defer trace("Create", name)()
+	g.waitPending(cp(name))
+	gf := goFlags(flags)
 	perm := fs.FileMode(mode & 0o7777)
 	if perm == 0 {
 		perm = 0o644
 	}
-	fh, err := g.v.OpenFile(g.ctx(), cp(name), flags|os.O_CREATE, perm)
+	fh, err := g.v.OpenFile(g.ctx(), cp(name), gf|os.O_CREATE, perm)
 	if err != nil {
 		return errc(err), ^uint64(0)
 	}
 	g.invalidate(cp(name))
-	return 0, g.addHandle(&lazyFile{g: g, path: cp(name), flags: flags, fh: fh})
+	lf := &lazyFile{g: g, path: cp(name), flags: gf, fh: fh}
+	lf.written.Store(true)
+	return 0, g.addHandle(lf)
 }
 
 func (g *winFS) Mkdir(name string, mode uint32) int {
+	defer trace("Mkdir", name)()
 	perm := fs.FileMode(mode & 0o7777)
 	if perm == 0 {
 		perm = 0o755
@@ -600,6 +683,8 @@ func (g *winFS) Mkdir(name string, mode uint32) int {
 }
 
 func (g *winFS) Unlink(name string) int {
+	defer trace("Unlink", name)()
+	g.waitPending(cp(name))
 	defer g.invalidate(cp(name))
 	return errc(g.v.Remove(g.ctx(), cp(name)))
 }
@@ -610,6 +695,9 @@ func (g *winFS) Rmdir(name string) int {
 }
 
 func (g *winFS) Rename(oldName, newName string) int {
+	defer trace("Rename", oldName)()
+	g.waitPending(cp(oldName))
+	g.waitPending(cp(newName))
 	defer g.invalidate(cp(oldName), cp(newName))
 	return errc(g.v.Rename(g.ctx(), cp(oldName), cp(newName)))
 }
@@ -635,6 +723,7 @@ func (g *winFS) Link(oldName, newName string) int {
 }
 
 func (g *winFS) Chmod(name string, mode uint32) int {
+	defer trace("Chmod", name)()
 	defer g.invalidate(cp(name))
 	return errc(g.v.Chmod(g.ctx(), cp(name), fs.FileMode(mode&0o7777)))
 }
@@ -644,6 +733,7 @@ func (g *winFS) Chflags(string, uint32) int          { return 0 }
 func (g *winFS) Setcrtime(string, fuse.Timespec) int { return 0 }
 
 func (g *winFS) Utimens(name string, tmsp []fuse.Timespec) int {
+	defer trace("Utimens", name)()
 	if len(tmsp) < 2 {
 		return 0
 	}
@@ -667,6 +757,10 @@ func (g *winFS) Utimens(name string, tmsp []fuse.Timespec) int {
 }
 
 func (g *winFS) Truncate(name string, size int64, fh uint64) int {
+	defer trace("Truncate", name)()
+	if g.handle(fh) == nil {
+		g.waitPending(cp(name))
+	}
 	if h := g.handle(fh); h != nil {
 		return errc(h.Truncate(size))
 	}
@@ -698,29 +792,95 @@ func (g *winFS) Write(_ string, buff []byte, ofst int64, fh uint64) int {
 	return n
 }
 
-func (g *winFS) Flush(name string, fh uint64) int {
-	if h := g.handle(fh); h != nil {
-		defer g.invalidate(cp(name))
-		return errc(h.Flush())
-	}
-	return 0
+// Flush and Fsync are no-ops: committing uploads the whole file, so doing it on every flush
+// would re-upload partial content. Data is committed once, when the last handle closes.
+func (g *winFS) Flush(string, uint64) int       { return 0 }
+func (g *winFS) Fsync(string, bool, uint64) int { return 0 }
+
+// pendingEntry describes a closed file whose upload is still running in the background. It
+// keeps the file visible (with its final size) and makes opens wait until the upload lands.
+type pendingEntry struct {
+	size  int64
+	mtime time.Time
+	done  chan struct{}
 }
 
-func (g *winFS) Fsync(_ string, _ bool, fh uint64) int {
-	if h := g.handle(fh); h != nil {
-		return errc(h.Sync())
+func (g *winFS) waitPending(p string) {
+	g.dmu.Lock()
+	e := g.pending[p]
+	g.dmu.Unlock()
+	if e != nil {
+		<-e.done
 	}
-	return 0
+}
+
+func (g *winFS) waitAllPending() {
+	for {
+		g.dmu.Lock()
+		var e *pendingEntry
+		for _, v := range g.pending {
+			e = v
+			break
+		}
+		g.dmu.Unlock()
+		if e == nil {
+			return
+		}
+		<-e.done
+	}
+}
+
+func pendingNode(p string, e *pendingEntry) *vfs.NodeInfo {
+	return &vfs.NodeInfo{FileName: path.Base(p), FileSize: e.size, FileMode: 0o644, Mtime: e.mtime, Ino: vfs.StableIno(p), Nlink: 1}
+}
+
+func (g *winFS) pendingInfo(p string) *vfs.NodeInfo {
+	g.dmu.Lock()
+	defer g.dmu.Unlock()
+	if e := g.pending[p]; e != nil {
+		return pendingNode(p, e)
+	}
+	return nil
+}
+
+func (g *winFS) pendingIn(dir string) []*vfs.NodeInfo {
+	g.dmu.Lock()
+	defer g.dmu.Unlock()
+	var out []*vfs.NodeInfo
+	for p, e := range g.pending {
+		if path.Dir(p) == dir {
+			out = append(out, pendingNode(p, e))
+		}
+	}
+	return out
 }
 
 func (g *winFS) Release(name string, fh uint64) int {
+	defer trace("Release", name)()
 	g.mu.Lock()
 	h := g.handles[fh]
 	delete(g.handles, fh)
 	g.mu.Unlock()
-	if h == nil {
+	if h == nil || h.opened() == nil {
 		return 0
 	}
-	defer g.invalidate(cp(name))
-	return errc(h.Close())
+	if !h.written.Load() {
+		return errc(h.Close())
+	}
+	p := cp(name)
+	e := &pendingEntry{size: h.Size(), mtime: time.Now(), done: make(chan struct{})}
+	g.dmu.Lock()
+	g.pending[p] = e
+	g.dmu.Unlock()
+	go func() {
+		if err := h.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "gpix: upload of %s failed: %v\n", p, err)
+		}
+		g.dmu.Lock()
+		delete(g.pending, p)
+		g.dmu.Unlock()
+		g.invalidate(p)
+		close(e.done)
+	}()
+	return 0
 }

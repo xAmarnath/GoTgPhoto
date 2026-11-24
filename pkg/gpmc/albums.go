@@ -293,21 +293,43 @@ func (c *Client) ListAlbumItems(ctx context.Context, albumMediaKey string) ([]Me
 
 const maxAlbumScanPages = 50
 
+// materializeItems resolves media keys the library snapshot does not know yet (just-uploaded
+// items). Hits are cached, misses are remembered for a while, and only the newest pages are
+// scanned, so repeated lookups of a brand-new file do not each pay a multi-page walk.
 func (c *Client) materializeItems(ctx context.Context, keys []string) ([]MediaItem, error) {
-	want := map[string]bool{}
-	for _, k := range keys {
-		want[k] = true
-	}
+	const (
+		missTTL   = 30 * time.Second
+		scanPages = 6
+	)
 	out := []MediaItem{}
+	want := map[string]bool{}
+	c.matMu.Lock()
+	if c.matItems == nil {
+		c.matItems = map[string]MediaItem{}
+		c.matMiss = map[string]time.Time{}
+	}
+	for _, k := range keys {
+		if it, ok := c.matItems[k]; ok {
+			out = append(out, it)
+		} else if t, ok := c.matMiss[k]; !ok || time.Since(t) > missTTL {
+			want[k] = true
+		}
+	}
+	c.matMu.Unlock()
+	if len(want) == 0 {
+		return out, nil
+	}
+
+	found := []MediaItem{}
 	cursor := ""
-	for i := 0; i < maxAlbumScanPages && len(want) > 0; i++ {
+	for i := 0; i < scanPages && len(want) > 0; i++ {
 		page, err := c.ListPage(ctx, cursor)
 		if err != nil {
-			return out, err
+			return append(out, found...), err
 		}
 		for _, it := range page.Items {
 			if want[it.MediaKey] {
-				out = append(out, it)
+				found = append(found, it)
 				delete(want, it.MediaKey)
 			}
 		}
@@ -316,5 +338,14 @@ func (c *Client) materializeItems(ctx context.Context, keys []string) ([]MediaIt
 		}
 		cursor = page.NextToken
 	}
-	return out, nil
+
+	c.matMu.Lock()
+	for _, it := range found {
+		c.matItems[it.MediaKey] = it
+	}
+	for k := range want {
+		c.matMiss[k] = time.Now()
+	}
+	c.matMu.Unlock()
+	return append(out, found...), nil
 }

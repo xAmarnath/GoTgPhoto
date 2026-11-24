@@ -2,8 +2,12 @@ package gpmc
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sort"
-	"sync"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -54,16 +58,23 @@ type rawSyncSnapshot struct {
 }
 
 type syncCache struct {
-	mu   sync.Mutex
-	at   time.Time
-	snap *rawSyncSnapshot
+	at      time.Time
+	snap    *rawSyncSnapshot
+	invalid bool
 }
 
-const syncCacheTTL = 60 * time.Second
+const (
+	syncCacheTTL = 5 * time.Minute
+	syncStaleMax = 6 * time.Hour
+)
 
+// InvalidateSyncCache marks the snapshot out of date. It is still served while a background
+// refresh runs: a full library walk takes many seconds and used to block every listing.
 func (c *Client) InvalidateSyncCache() {
 	c.syncMu.Lock()
-	c.sync = nil
+	if c.sync != nil {
+		c.sync.invalid = true
+	}
 	c.syncMu.Unlock()
 }
 
@@ -96,22 +107,58 @@ func (c *Client) GetItem(ctx context.Context, mediaKey string) (MediaItem, bool,
 
 func (c *Client) getSync(ctx context.Context) (*rawSyncSnapshot, error) {
 	c.syncMu.Lock()
-	if c.sync != nil && time.Since(c.sync.at) < syncCacheTTL {
-		s := c.sync.snap
+	if cur := c.sync; cur != nil {
+		age := time.Since(cur.at)
+		if !cur.invalid && age < syncCacheTTL {
+			c.syncMu.Unlock()
+			return cur.snap, nil
+		}
+		if age < syncStaleMax {
+			c.startSyncRefreshLocked()
+			c.syncMu.Unlock()
+			return cur.snap, nil
+		}
+	}
+	fl := c.startSyncRefreshLocked()
+	c.syncMu.Unlock()
+
+	select {
+	case <-fl.done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if fl.err != nil {
+		return nil, fl.err
+	}
+	return fl.snap, nil
+}
+
+type syncFlight struct {
+	done chan struct{}
+	snap *rawSyncSnapshot
+	err  error
+}
+
+// startSyncRefreshLocked joins the in-flight fetch or starts one. Caller holds syncMu.
+func (c *Client) startSyncRefreshLocked() *syncFlight {
+	if c.syncFlight != nil {
+		return c.syncFlight
+	}
+	fl := &syncFlight{done: make(chan struct{})}
+	c.syncFlight = fl
+	go func() {
+		snap, err := c.fetchSync(context.Background())
+		c.syncMu.Lock()
+		if err == nil {
+			c.sync = &syncCache{at: time.Now(), snap: snap}
+			go c.saveSyncSnapshot(snap)
+		}
+		c.syncFlight = nil
 		c.syncMu.Unlock()
-		return s, nil
-	}
-	c.syncMu.Unlock()
-
-	snap, err := c.fetchSync(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	c.syncMu.Lock()
-	c.sync = &syncCache{at: time.Now(), snap: snap}
-	c.syncMu.Unlock()
-	return snap, nil
+		fl.snap, fl.err = snap, err
+		close(fl.done)
+	}()
+	return fl
 }
 
 func (c *Client) fetchSync(ctx context.Context) (*rawSyncSnapshot, error) {
@@ -259,4 +306,67 @@ func (c *Client) walkAlbumMembershipFromSync(ctx context.Context, albumKey strin
 		}
 	}
 	return keys, items, nil
+}
+
+type diskSnapshot struct {
+	At          time.Time
+	SyncToken   string
+	Albums      []Album
+	Memberships map[string][]string
+	Items       []MediaItem
+}
+
+func (c *Client) snapshotPath() string {
+	d, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	h := sha1.Sum([]byte(c.authData))
+	return filepath.Join(d, "gpix", "sync-"+hex.EncodeToString(h[:4])+".json")
+}
+
+func (c *Client) saveSyncSnapshot(snap *rawSyncSnapshot) {
+	p := c.snapshotPath()
+	if p == "" {
+		return
+	}
+	ds := diskSnapshot{At: time.Now(), SyncToken: snap.syncToken, Albums: snap.albums, Memberships: snap.memberships}
+	for _, it := range snap.itemsByKey {
+		ds.Items = append(ds.Items, it)
+	}
+	b, err := json.Marshal(ds)
+	if err != nil || os.MkdirAll(filepath.Dir(p), 0o755) != nil {
+		return
+	}
+	tmp := p + ".tmp"
+	if os.WriteFile(tmp, b, 0o644) == nil {
+		_ = os.Rename(tmp, p)
+	}
+}
+
+// loadSyncSnapshot restores the last library snapshot so the first listing after a restart
+// does not wait for a full library walk; it is served stale while a refresh runs.
+func (c *Client) loadSyncSnapshot() {
+	p := c.snapshotPath()
+	if p == "" {
+		return
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	var ds diskSnapshot
+	if json.Unmarshal(b, &ds) != nil || time.Since(ds.At) > syncStaleMax {
+		return
+	}
+	snap := &rawSyncSnapshot{syncToken: ds.SyncToken, albums: ds.Albums, memberships: ds.Memberships, itemsByKey: make(map[string]MediaItem, len(ds.Items))}
+	if snap.memberships == nil {
+		snap.memberships = map[string][]string{}
+	}
+	for _, it := range ds.Items {
+		snap.itemsByKey[it.MediaKey] = it
+	}
+	c.syncMu.Lock()
+	c.sync = &syncCache{at: ds.At, snap: snap, invalid: true}
+	c.syncMu.Unlock()
 }

@@ -2,6 +2,8 @@ package gpmc
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"errors"
 	"io"
 	"io/fs"
@@ -42,6 +44,7 @@ func (s Stage) String() string {
 
 type UploadResult struct {
 	Path     string
+	SHA1     []byte
 	MediaKey string
 	Skipped  bool
 	Err      error
@@ -64,53 +67,98 @@ func (c *Client) UploadFileWithProgress(ctx context.Context, path string, opts U
 }
 
 func (c *Client) uploadOne(ctx context.Context, path string, opts UploadOpts, progress func(UploadEvent)) (UploadResult, error) {
-	emit := func(s Stage, done, total int64, err error) {
-		if progress != nil {
-			progress(UploadEvent{Path: path, Stage: s, BytesDone: done, BytesTotal: total, Err: err})
-		}
-	}
-	res := UploadResult{Path: path}
-
 	st, err := os.Stat(path)
 	if err != nil {
-		res.Err = err
-		emit(StageHash, 0, 0, err)
-		return res, err
+		if progress != nil {
+			progress(UploadEvent{Path: path, Stage: StageHash, Err: err})
+		}
+		return UploadResult{Path: path, Err: err}, err
 	}
 	if st.IsDir() {
-		res.Err = errors.New("gpmc: uploadOne called on a directory")
-		return res, res.Err
+		err := errors.New("gpmc: uploadOne called on a directory")
+		return UploadResult{Path: path, Err: err}, err
 	}
-	size := st.Size()
-	mtime := st.ModTime()
 	name := filepath.Base(path)
 	if opts.OverrideName != "" {
 		name = opts.OverrideName
 	}
+	src := uploadSource{
+		label: path,
+		name:  name,
+		size:  st.Size(),
+		mtime: st.ModTime(),
+		open:  func() (io.ReadCloser, error) { return os.Open(path) },
+	}
+	res, err := c.uploadSource(ctx, src, opts, progress)
+	if err == nil && opts.DeleteAfter {
+		_ = os.Remove(path)
+	}
+	return res, err
+}
 
-	emit(StageHash, 0, size, nil)
-	digest, b64, err := HashFile(path)
+// UploadStream uploads content produced by open (called once for hashing and again for each
+// PUT attempt) without requiring it to exist as a single file on disk.
+func (c *Client) UploadStream(ctx context.Context, name string, size int64, mtime time.Time, open func() (io.ReadCloser, error), opts UploadOpts) (UploadResult, error) {
+	if opts.OverrideName != "" {
+		name = opts.OverrideName
+	}
+	return c.uploadSource(ctx, uploadSource{label: name, name: name, size: size, mtime: mtime, open: open}, opts, nil)
+}
+
+type uploadSource struct {
+	label string
+	name  string
+	size  int64
+	mtime time.Time
+	open  func() (io.ReadCloser, error)
+}
+
+func hashSource(open func() (io.ReadCloser, error)) ([]byte, string, error) {
+	rc, err := open()
 	if err != nil {
+		return nil, "", err
+	}
+	defer rc.Close()
+	h := sha1.New()
+	if _, err := io.CopyBuffer(h, rc, make([]byte, 1<<20)); err != nil {
+		return nil, "", err
+	}
+	sum := h.Sum(nil)
+	return sum, base64.StdEncoding.EncodeToString(sum), nil
+}
+
+func (c *Client) uploadSource(ctx context.Context, src uploadSource, opts UploadOpts, progress func(UploadEvent)) (UploadResult, error) {
+	emit := func(s Stage, done, total int64, err error) {
+		if progress != nil {
+			progress(UploadEvent{Path: src.label, Stage: s, BytesDone: done, BytesTotal: total, Err: err})
+		}
+	}
+	res := UploadResult{Path: src.label}
+	size := src.size
+	fail := func(s Stage, done int64, err error) (UploadResult, error) {
 		res.Err = err
-		emit(StageHash, 0, size, err)
+		emit(s, done, size, err)
 		return res, err
 	}
+
+	emit(StageHash, 0, size, nil)
+	digest, b64, err := hashSource(src.open)
+	if err != nil {
+		return fail(StageHash, 0, err)
+	}
+
+	res.SHA1 = digest
 
 	if !opts.Force {
 		emit(StageDedup, 0, size, nil)
 		key, found, err := c.findRemoteMediaByHash(ctx, digest)
 		if err != nil {
-			res.Err = err
-			emit(StageDedup, 0, size, err)
-			return res, err
+			return fail(StageDedup, 0, err)
 		}
 		if found {
 			res.MediaKey = key
 			res.Skipped = true
 			emit(StageDone, size, size, nil)
-			if opts.DeleteAfter {
-				_ = os.Remove(path)
-			}
 			return res, nil
 		}
 	}
@@ -118,48 +166,30 @@ func (c *Client) uploadOne(ctx context.Context, path string, opts UploadOpts, pr
 	emit(StageGetToken, 0, size, nil)
 	uploadID, err := c.getUploadToken(ctx, b64, size)
 	if err != nil {
-		res.Err = err
-		emit(StageGetToken, 0, size, err)
-		return res, err
+		return fail(StageGetToken, 0, err)
 	}
 
 	emit(StagePut, 0, size, nil)
 	receipt, err := c.putFile(ctx, uploadID, func() (io.ReadCloser, error) {
-		f, err := os.Open(path)
-		if err != nil {
-			return nil, err
+		rc, err := src.open()
+		if err != nil || progress == nil {
+			return rc, err
 		}
-		if progress == nil {
-			return f, nil
-		}
-		return &progressReader{
-			rc:    f,
-			total: size,
-			emit: func(done int64) {
-				emit(StagePut, done, size, nil)
-			},
-		}, nil
+		return &progressReader{rc: rc, total: size, emit: func(done int64) { emit(StagePut, done, size, nil) }}, nil
 	}, size)
 	if err != nil {
-		res.Err = err
-		emit(StagePut, 0, size, err)
-		return res, err
+		return fail(StagePut, 0, err)
 	}
 
 	emit(StageCommit, size, size, nil)
-	key, err := c.commitUpload(ctx, receipt, name, digest, opts.Quality, c.profile, mtime)
+	key, err := c.commitUpload(ctx, receipt, src.name, digest, opts.Quality, c.profile, src.mtime)
 	if err != nil {
-		res.Err = err
-		emit(StageCommit, size, size, err)
-		return res, err
+		return fail(StageCommit, size, err)
 	}
 
 	res.MediaKey = key
 	c.InvalidateSyncCache()
 	emit(StageDone, size, size, nil)
-	if opts.DeleteAfter {
-		_ = os.Remove(path)
-	}
 	return res, nil
 }
 

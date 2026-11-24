@@ -30,7 +30,7 @@ func (f *FS) InspectMedia(ctx context.Context, item gpmc.MediaItem) (DisguiseMet
 	if item.MediaKey == "" {
 		return DisguiseMeta{}, errors.New("vfs: empty media key")
 	}
-	if d, ok := f.meta.GetDisguise(item.MediaKey); ok {
+	if d, ok := f.meta.DisguiseFor(item.MediaKey, item.SHA1); ok {
 		return d, nil
 	}
 
@@ -58,7 +58,7 @@ func (f *FS) InspectMedia(ctx context.Context, item gpmc.MediaItem) (DisguiseMet
 			PayloadSize: item.SizeBytes,
 		}
 	}
-	f.meta.PutDisguise(item.MediaKey, dm)
+	f.meta.PutDisguiseSHA(item.MediaKey, item.SHA1, dm)
 	return dm, nil
 }
 

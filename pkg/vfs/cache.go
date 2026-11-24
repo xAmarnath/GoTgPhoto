@@ -3,6 +3,7 @@ package vfs
 import (
 	"container/list"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,7 +20,6 @@ import (
 const (
 	chunkSize       = 1 << 20 // 1 MiB per cached range block
 	defaultMaxChunk = 160     // 160 MiB bounded RAM cache
-	readAheadBlocks = 8       // sequential prefetch depth, fetched in parallel
 	urlCacheTTL     = 45 * time.Minute
 	maxDiskCache    = 512 << 20 // 512 MiB bounded disk decrypt cache
 )
@@ -70,6 +70,14 @@ func (c *downloadURLCache) Invalidate(mediaKey string) {
 	c.mu.Unlock()
 }
 
+// readAheadBlocks is the sequential prefetch depth, fetched in parallel (GPIX_READAHEAD).
+var readAheadBlocks = func() int64 {
+	if v, err := strconv.Atoi(os.Getenv("GPIX_READAHEAD")); err == nil && v >= 0 {
+		return int64(v)
+	}
+	return 8
+}()
+
 type chunkKey struct {
 	mediaKey string
 	blockIdx int64
@@ -93,6 +101,12 @@ type rangeChunkCache struct {
 	items    map[chunkKey]*list.Element
 	inflight map[chunkKey]*inflightChunk
 	urls     *downloadURLCache
+
+	spoolMu  sync.Mutex
+	spools   map[string]*spool
+	noRange  map[string]bool
+	rangeOK  map[string]bool
+	spoolDir string
 }
 
 func newRangeChunkCache(urls *downloadURLCache, maxBlocks int) *rangeChunkCache {
@@ -105,6 +119,9 @@ func newRangeChunkCache(urls *downloadURLCache, maxBlocks int) *rangeChunkCache 
 		items:    map[chunkKey]*list.Element{},
 		inflight: map[chunkKey]*inflightChunk{},
 		urls:     urls,
+		spools:   map[string]*spool{},
+		noRange:  map[string]bool{},
+		rangeOK:  map[string]bool{},
 	}
 }
 
@@ -138,7 +155,18 @@ func (rc *rangeChunkCache) ReadPhysicalAt(ctx context.Context, hc *http.Client, 
 		want = int(totalPhysLimit - physOff)
 	}
 
+	if rc.isNoRange(mediaKey) {
+		return rc.spoolRead(ctx, hc, mediaKey, p, physOff, totalPhysLimit)
+	}
+
 	first := physOff / chunkSize
+	if !rc.isRangeOK(mediaKey) {
+		// Probe with a single request before fanning out: an upstream that ignores Range would
+		// otherwise be hit with a full-object download per prefetched block.
+		if _, err := rc.getBlock(ctx, hc, mediaKey, first); errors.Is(err, errNoRange) {
+			return rc.spoolRead(ctx, hc, mediaKey, p, physOff, totalPhysLimit)
+		}
+	}
 	last := (physOff + int64(want) - 1) / chunkSize
 	var limitBlk int64 = -1
 	if totalPhysLimit > 0 {
@@ -170,6 +198,9 @@ func (rc *rangeChunkCache) ReadPhysicalAt(ctx context.Context, hc *http.Client, 
 		blkOff := int(curOff % chunkSize)
 
 		blk, err := rc.getBlock(ctx, hc, mediaKey, blkIdx)
+		if errors.Is(err, errNoRange) && written == 0 {
+			return rc.spoolRead(ctx, hc, mediaKey, p, physOff, totalPhysLimit)
+		}
 		if err != nil {
 			if written > 0 {
 				return written, nil
@@ -220,7 +251,15 @@ func (rc *rangeChunkCache) getBlock(ctx context.Context, hc *http.Client, mediaK
 	fetchCtx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	data, err := rc.fetchBlockHTTP(fetchCtx, hc, mediaKey, blkIdx)
+	var data []byte
+	var err error
+	for try := 0; try < 3; try++ {
+		data, err = rc.fetchBlockHTTP(fetchCtx, hc, mediaKey, blkIdx)
+		if err == nil || errors.Is(err, io.EOF) || fetchCtx.Err() != nil {
+			break
+		}
+		time.Sleep(time.Duration(try+1) * 500 * time.Millisecond)
+	}
 
 	rc.mu.Lock()
 	delete(rc.inflight, key)
@@ -263,7 +302,18 @@ func (rc *rangeChunkCache) fetchBlockHTTP(ctx context.Context, hc *http.Client, 
 			return nil, err
 		}
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+		t0 := time.Now()
+		if os.Getenv("GPIX_TRACE") != "" && blkIdx == 300 {
+			fmt.Fprintf(os.Stderr, "URL %s\n", dlURL)
+		}
 		resp, err := hc.Do(req)
+		if os.Getenv("GPIX_TRACE") != "" {
+			code := 0
+			if resp != nil {
+				code = resp.StatusCode
+			}
+			fmt.Fprintf(os.Stderr, "FETCH blk %d status %d hdr %v err %v\n", blkIdx, code, time.Since(t0).Round(time.Millisecond), err)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -281,12 +331,17 @@ func (rc *rangeChunkCache) fetchBlockHTTP(ctx context.Context, hc *http.Client, 
 			resp.Body.Close()
 			return nil, fmt.Errorf("vfs: range GET %s status %d: %s", mediaKey, resp.StatusCode, string(body))
 		}
-		if resp.StatusCode == http.StatusOK && start > 0 {
-			// Upstream ignored Range; discard prefix up to start.
-			if _, err := io.CopyN(io.Discard, resp.Body, start); err != nil {
-				resp.Body.Close()
-				return nil, err
-			}
+		if resp.StatusCode == http.StatusPartialContent {
+			rc.spoolMu.Lock()
+			rc.rangeOK[mediaKey] = true
+			rc.spoolMu.Unlock()
+		}
+		if resp.StatusCode == http.StatusOK && resp.ContentLength > chunkSize {
+			// Upstream (video-downloads.googleusercontent.com) ignores Range and streams the
+			// whole object; stop fetching blocks and switch this item to a sequential spool.
+			rc.markNoRange(mediaKey)
+			_, _ = rc.newSpool(hc, mediaKey, resp)
+			return nil, errNoRange
 		}
 		buf, err := io.ReadAll(io.LimitReader(resp.Body, chunkSize))
 		resp.Body.Close()
@@ -412,4 +467,259 @@ func safeCacheName(s string) string {
 		return strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
 	return string(out)
+}
+
+var errNoRange = errors.New("vfs: upstream does not support range requests")
+
+func (rc *rangeChunkCache) isNoRange(mediaKey string) bool {
+	rc.spoolMu.Lock()
+	defer rc.spoolMu.Unlock()
+	return rc.noRange[mediaKey]
+}
+
+func (rc *rangeChunkCache) isRangeOK(mediaKey string) bool {
+	rc.spoolMu.Lock()
+	defer rc.spoolMu.Unlock()
+	return rc.rangeOK[mediaKey]
+}
+
+func (rc *rangeChunkCache) markNoRange(mediaKey string) {
+	rc.spoolMu.Lock()
+	rc.noRange[mediaKey] = true
+	rc.spoolMu.Unlock()
+}
+
+// spool is a progressive on-disk copy of a remote object that cannot be fetched by range:
+// one sequential download writes the file while readers wait for the bytes they need.
+type spool struct {
+	mu         sync.Mutex
+	cond       *sync.Cond
+	f          *os.File
+	path       string
+	downloaded int64
+	done       bool
+	err        error
+	lastUse    time.Time
+}
+
+const maxSpoolBytes = 2 << 30
+
+func (rc *rangeChunkCache) getSpool(hc *http.Client, mediaKey string) (*spool, error) {
+	return rc.newSpool(hc, mediaKey, nil)
+}
+
+// newSpool returns the item's spool, creating it if needed. A non-nil first is an already open
+// full-object response (from the range probe) that the download continues from.
+func (rc *rangeChunkCache) newSpool(hc *http.Client, mediaKey string, first *http.Response) (*spool, error) {
+	rc.spoolMu.Lock()
+	defer rc.spoolMu.Unlock()
+	if sp, ok := rc.spools[mediaKey]; ok {
+		if first != nil {
+			first.Body.Close()
+		}
+		return sp, nil
+	}
+	dir := rc.spoolDirOrDefault()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		if first != nil {
+			first.Body.Close()
+		}
+		return nil, err
+	}
+	f, err := os.CreateTemp(dir, "spool-*")
+	if err != nil {
+		if first != nil {
+			first.Body.Close()
+		}
+		return nil, err
+	}
+	sp := &spool{f: f, path: f.Name(), lastUse: time.Now()}
+	sp.cond = sync.NewCond(&sp.mu)
+	rc.spools[mediaKey] = sp
+	rc.evictSpoolsLocked(mediaKey)
+	go rc.runSpool(hc, mediaKey, sp, first)
+	return sp, nil
+}
+
+// evictSpoolsLocked drops the least recently used finished spools beyond maxSpoolBytes.
+func (rc *rangeChunkCache) evictSpoolsLocked(keep string) {
+	type ent struct {
+		key  string
+		sp   *spool
+		size int64
+		at   time.Time
+	}
+	var all []ent
+	var total int64
+	for k, sp := range rc.spools {
+		sp.mu.Lock()
+		e := ent{k, sp, sp.downloaded, sp.lastUse}
+		fin := sp.done
+		sp.mu.Unlock()
+		total += e.size
+		if fin && k != keep {
+			all = append(all, e)
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
+	for _, e := range all {
+		if total <= maxSpoolBytes {
+			break
+		}
+		delete(rc.spools, e.key)
+		_ = e.sp.f.Close()
+		_ = os.Remove(e.sp.path)
+		total -= e.size
+	}
+}
+
+func (rc *rangeChunkCache) dropSpool(mediaKey string, sp *spool) {
+	rc.spoolMu.Lock()
+	if rc.spools[mediaKey] == sp {
+		delete(rc.spools, mediaKey)
+	}
+	rc.spoolMu.Unlock()
+	_ = sp.f.Close()
+	_ = os.Remove(sp.path)
+}
+
+func (rc *rangeChunkCache) runSpool(hc *http.Client, mediaKey string, sp *spool, first *http.Response) {
+	fail := func(err error) {
+		sp.mu.Lock()
+		sp.err = err
+		sp.cond.Broadcast()
+		sp.mu.Unlock()
+		// Removed from the map so the next read starts a fresh download.
+		rc.spoolMu.Lock()
+		if rc.spools[mediaKey] == sp {
+			delete(rc.spools, mediaKey)
+		}
+		rc.spoolMu.Unlock()
+	}
+	ctx := context.Background()
+	for attempt := 0; attempt < 2; attempt++ {
+		var resp *http.Response
+		if first != nil {
+			resp, first = first, nil
+		} else {
+			dlURL, err := rc.urls.Get(ctx, mediaKey)
+			if err != nil {
+				fail(err)
+				return
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, dlURL, nil)
+			if err != nil {
+				fail(err)
+				return
+			}
+			resp, err = hc.Do(req)
+			if err != nil {
+				fail(err)
+				return
+			}
+		}
+		if (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusGone) && attempt == 0 {
+			resp.Body.Close()
+			rc.urls.Invalidate(mediaKey)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			fail(fmt.Errorf("vfs: spool GET %s status %d", mediaKey, resp.StatusCode))
+			return
+		}
+		buf := make([]byte, 512<<10)
+		for {
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				if _, werr := sp.f.WriteAt(buf[:n], sp.downloadedNow()); werr != nil {
+					resp.Body.Close()
+					fail(werr)
+					return
+				}
+				sp.mu.Lock()
+				sp.downloaded += int64(n)
+				sp.cond.Broadcast()
+				sp.mu.Unlock()
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				resp.Body.Close()
+				fail(rerr)
+				return
+			}
+		}
+		resp.Body.Close()
+		sp.mu.Lock()
+		sp.done = true
+		sp.cond.Broadcast()
+		sp.mu.Unlock()
+		return
+	}
+	fail(fmt.Errorf("vfs: spool download failed for %s", mediaKey))
+}
+
+func (sp *spool) downloadedNow() int64 {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	return sp.downloaded
+}
+
+func (rc *rangeChunkCache) spoolRead(ctx context.Context, hc *http.Client, mediaKey string, p []byte, physOff, limit int64) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if limit > 0 && physOff >= limit {
+		return 0, io.EOF
+	}
+	want := int64(len(p))
+	if limit > 0 && physOff+want > limit {
+		want = limit - physOff
+	}
+	sp, err := rc.getSpool(hc, mediaKey)
+	if err != nil {
+		return 0, err
+	}
+	stop := context.AfterFunc(ctx, func() {
+		sp.mu.Lock()
+		sp.cond.Broadcast()
+		sp.mu.Unlock()
+	})
+	defer stop()
+
+	need := physOff + want
+	sp.mu.Lock()
+	sp.lastUse = time.Now()
+	for sp.downloaded < need && !sp.done && sp.err == nil && ctx.Err() == nil {
+		sp.cond.Wait()
+	}
+	avail, done, serr := sp.downloaded, sp.done, sp.err
+	sp.mu.Unlock()
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	if physOff >= avail {
+		if serr != nil {
+			return 0, serr
+		}
+		return 0, io.EOF
+	}
+	n := min(want, avail-physOff)
+	got, rerr := sp.f.ReadAt(p[:n], physOff)
+	if rerr != nil && !errors.Is(rerr, io.EOF) {
+		return got, rerr
+	}
+	if int64(got) < int64(len(p)) && done && physOff+int64(got) >= avail {
+		return got, io.EOF
+	}
+	return got, nil
+}
+
+func (rc *rangeChunkCache) spoolDirOrDefault() string {
+	if rc.spoolDir != "" {
+		return rc.spoolDir
+	}
+	return filepath.Join(os.TempDir(), "gpix-spool")
 }

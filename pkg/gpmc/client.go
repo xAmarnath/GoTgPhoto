@@ -27,8 +27,13 @@ type Client struct {
 
 	albums *albumstore.Store
 
-	syncMu sync.Mutex
-	sync   *syncCache
+	syncMu     sync.Mutex
+	sync       *syncCache
+	syncFlight *syncFlight
+
+	matMu    sync.Mutex
+	matItems map[string]MediaItem
+	matMiss  map[string]time.Time
 }
 
 func (c *Client) AlbumStore() *albumstore.Store { return c.albums }
@@ -55,6 +60,7 @@ func New(authData string, opts ...Option) (*Client, error) {
 	}
 	if c.httpc == nil {
 		tr := &http.Transport{
+			DialContext:           newDNSCacheDialer().DialContext,
 			Proxy:                 http.ProxyFromEnvironment,
 			TLSHandshakeTimeout:   30 * time.Second,
 			ResponseHeaderTimeout: 60 * time.Second,
@@ -70,5 +76,6 @@ func New(authData string, opts ...Option) (*Client, error) {
 		}
 		c.httpc = &http.Client{Transport: tr}
 	}
+	c.loadSyncSnapshot()
 	return c, nil
 }

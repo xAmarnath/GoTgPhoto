@@ -101,6 +101,10 @@ func New(gp *gpmc.Client, cfg Config) (*FS, error) {
 	urls := newDownloadURLCache(gp)
 	chunks := newRangeChunkCache(urls, cfg.MaxCacheBlocks)
 	dec := newDiskDecryptCache(cfg.TempDir)
+	if cfg.TempDir != "" {
+		chunks.spoolDir = filepath.Join(cfg.TempDir, "gpix-spool")
+	}
+	_ = os.RemoveAll(chunks.spoolDirOrDefault()) // leftovers from a previous run
 
 	return &FS{
 		gp:       gp,
@@ -179,7 +183,7 @@ func (f *FS) LogicalName(it gpmc.MediaItem) string {
 	if ov, ok := f.meta.NameOverride(it.MediaKey); ok {
 		return ov
 	}
-	if d, ok := f.meta.GetDisguise(it.MediaKey); ok && d.Version > 0 && d.OriginalName != "" {
+	if d, ok := f.meta.DisguiseFor(it.MediaKey, it.SHA1); ok && d.Version > 0 && d.OriginalName != "" {
 		return d.OriginalName
 	}
 	if orig, ok := disguise.LooksLikeDisguisedFilename(it.Filename); ok {
@@ -192,7 +196,7 @@ func (f *FS) LogicalName(it gpmc.MediaItem) string {
 }
 
 func (f *FS) LogicalSize(it gpmc.MediaItem) int64 {
-	if d, ok := f.meta.GetDisguise(it.MediaKey); ok && d.Version > 0 && d.PayloadSize >= 0 {
+	if d, ok := f.meta.DisguiseFor(it.MediaKey, it.SHA1); ok && d.Version > 0 && d.PayloadSize >= 0 {
 		return d.PayloadSize
 	}
 	return it.SizeBytes
@@ -472,7 +476,7 @@ func (f *FS) resolveDepth(ctx context.Context, name string, followFinal bool, de
 			if !ok {
 				return resolvedTarget{}, os.ErrNotExist
 			}
-			items, err := f.gp.ListAlbumItems(ctx, album.MediaKey)
+			items, err := f.albumItems(ctx, album.MediaKey)
 			if err != nil {
 				return resolvedTarget{}, err
 			}
@@ -485,6 +489,24 @@ func (f *FS) resolveDepth(ctx context.Context, name string, followFinal bool, de
 	}
 
 	return resolvedTarget{}, os.ErrNotExist
+}
+
+func albumHideKey(albumKey, mediaKey string) string { return "alb:" + albumKey + "|" + mediaKey }
+
+// albumItems lists an album, minus items unlinked locally: the library snapshot can lag behind
+// the album store, so unlinks are remembered here.
+func (f *FS) albumItems(ctx context.Context, albumKey string) ([]gpmc.MediaItem, error) {
+	items, err := f.gp.ListAlbumItems(ctx, albumKey)
+	if err != nil {
+		return nil, err
+	}
+	out := items[:0:0]
+	for _, it := range items {
+		if !f.meta.IsHidden(albumHideKey(albumKey, it.MediaKey)) {
+			out = append(out, it)
+		}
+	}
+	return out, nil
 }
 
 func (f *FS) uniqueDisplayItems(items []gpmc.MediaItem) map[string]gpmc.MediaItem {
@@ -603,7 +625,7 @@ func (f *FS) statInternal(ctx context.Context, name string, followSymlink bool, 
 
 	// For files whose exact disguise payload size hasn't been cached yet, probe on direct Stat.
 	if probeDisguise && r.item.MediaKey != "" {
-		if _, cached := f.meta.GetDisguise(r.item.MediaKey); !cached {
+		if _, cached := f.meta.DisguiseFor(r.item.MediaKey, r.item.SHA1); !cached {
 			if _, ok := disguise.LooksLikeDisguisedFilename(r.item.Filename); ok || strings.HasSuffix(strings.ToLower(r.item.Filename), ".mp4") {
 				pCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 				_, _ = f.InspectMedia(pCtx, r.item)
@@ -745,7 +767,7 @@ func (f *FS) ReadDir(ctx context.Context, name string) ([]*NodeInfo, error) {
 		if !ok {
 			return nil, os.ErrNotExist
 		}
-		items, err := f.gp.ListAlbumItems(ctx, album.MediaKey)
+		items, err := f.albumItems(ctx, album.MediaKey)
 		if err != nil {
 			return nil, err
 		}
@@ -980,6 +1002,17 @@ func (f *FS) Remove(ctx context.Context, name string) error {
 		if store := f.gp.AlbumStore(); store != nil {
 			if err := store.RemoveMembers(ctx, r.albumKey, []string{r.item.MediaKey}); err != nil {
 				return err
+			}
+			f.meta.HideKey(albumHideKey(r.albumKey, r.item.MediaKey))
+			// The path may resolve through a locally recorded key while the album lists the same
+			// file under another key, so hide every listed item carrying this name.
+			if listed, lerr := f.gp.ListAlbumItems(ctx, r.albumKey); lerr == nil {
+				base := path.Base(c)
+				for _, it := range listed {
+					if f.LogicalName(it) == base {
+						f.meta.HideKey(albumHideKey(r.albumKey, it.MediaKey))
+					}
+				}
 			}
 			f.gp.InvalidateSyncCache()
 			return nil

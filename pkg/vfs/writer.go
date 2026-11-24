@@ -1,6 +1,7 @@
 package vfs
 
 import (
+	"crypto/rand"
 	"context"
 	"errors"
 	"fmt"
@@ -219,6 +220,12 @@ func (fh *FileHandle) Truncate(size int64) error {
 	if fh.closed {
 		return os.ErrClosed
 	}
+	if size == 0 && fh.staged == nil {
+		// Truncating to zero replaces everything, so skip downloading the old content.
+		if err := fh.initEmptyStage(); err != nil {
+			return err
+		}
+	}
 	if err := fh.materializeLocked(context.Background()); err != nil {
 		return err
 	}
@@ -350,32 +357,50 @@ func (fh *FileHandle) commitLocked(ctx context.Context) error {
 		return err
 	}
 	logicalSize := st.Size()
-	stagePath := fh.staged.Name()
-
 	head := make([]byte, 512)
 	nHead, _ := fh.staged.ReadAt(head, 0)
 	head = head[:nHead]
 
-	uploadPath := stagePath
 	commitName := fh.filename
 	disguiseVer := 0
-	var wrappedTmp string
+	staged := fh.staged
+	openUpload := func() (io.ReadCloser, error) { return io.NopCloser(io.NewSectionReader(staged, 0, logicalSize)), nil }
+	uploadSize := logicalSize
 
 	// Google Photos rejects 0-byte media or arbitrary non-media formats unless wrapped in disguise MP4.
 	if logicalSize == 0 || disguise.ShouldWrap("", fh.filename, head) {
-		var werr error
-		wrappedTmp, disguiseVer, werr = wrapStageFile(fh.fs.stagingDir(), stagePath, fh.filename, logicalSize, fh.fs.cfg.EncPassphrase)
-		if werr != nil {
-			return fmt.Errorf("vfs: wrap %s: %w", fh.filename, werr)
-		}
-		defer os.Remove(wrappedTmp)
-		uploadPath = wrappedTmp
 		commitName = fh.filename + ".mp4"
+		if fh.fs.cfg.EncPassphrase == "" {
+			// V1 is a plain prefix + payload, so stream it straight from the staged file. The random
+			// tail keeps every upload unique (see disguise.WrapTail).
+			disguiseVer = 1
+			name := fh.filename
+			tail := make([]byte, 16)
+			_, _ = rand.Read(tail)
+			_, uploadSize = disguise.WrapTail(name, nil, logicalSize, tail)
+			openUpload = func() (io.ReadCloser, error) {
+				r, _ := disguise.WrapTail(name, io.NewSectionReader(staged, 0, logicalSize), logicalSize, tail)
+				return io.NopCloser(r), nil
+			}
+		} else {
+			wrappedTmp, ver, werr := wrapStageFile(fh.fs.stagingDir(), fh.staged.Name(), fh.filename, logicalSize, fh.fs.cfg.EncPassphrase)
+			if werr != nil {
+				return fmt.Errorf("vfs: wrap %s: %w", fh.filename, werr)
+			}
+			defer os.Remove(wrappedTmp)
+			disguiseVer = ver
+			openUpload = func() (io.ReadCloser, error) { return os.Open(wrappedTmp) }
+			if wst, serr := os.Stat(wrappedTmp); serr == nil {
+				uploadSize = wst.Size()
+			}
+		}
 	}
 
-	res, err := fh.fs.gp.UploadFile(ctx, uploadPath, gpmc.UploadOpts{
-		Quality:      fh.fs.cfg.Quality,
-		Force:        fh.existing != nil,
+	res, err := fh.fs.gp.UploadStream(ctx, commitName, uploadSize, time.Now(), openUpload, gpmc.UploadOpts{
+		Quality: fh.fs.cfg.Quality,
+		// Dedup can resolve to an item that was since deleted (404 on download), and costs a
+		// lookup per file, so always upload.
+		Force:        true,
 		OverrideName: commitName,
 	})
 	if err != nil {
@@ -389,11 +414,11 @@ func (fh *FileHandle) commitLocked(ctx context.Context) error {
 	if disguiseVer > 0 {
 		// Probe local wrapped file header so exact offset & size are cached immediately.
 		var wHead [64 * 1024]byte
-		if wf, oerr := os.Open(uploadPath); oerr == nil {
+		if wf, oerr := openUpload(); oerr == nil {
 			wn, _ := io.ReadFull(wf, wHead[:])
 			_ = wf.Close()
 			if ver, hdr, pOff, perr := disguise.PeekMeta(wHead[:wn]); perr == nil && ver > 0 {
-				fh.fs.meta.PutDisguise(newKey, DisguiseMeta{
+				fh.fs.meta.PutDisguiseSHA(newKey, res.SHA1, DisguiseMeta{
 					Checked:       true,
 					Version:       ver,
 					OriginalName:  hdr.Filename,
@@ -403,7 +428,7 @@ func (fh *FileHandle) commitLocked(ctx context.Context) error {
 			}
 		}
 	} else {
-		fh.fs.meta.PutDisguise(newKey, DisguiseMeta{
+		fh.fs.meta.PutDisguiseSHA(newKey, res.SHA1, DisguiseMeta{
 			Checked:     true,
 			Version:     0,
 			PayloadSize: logicalSize,

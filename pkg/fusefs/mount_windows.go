@@ -775,7 +775,8 @@ func (g *winFS) Truncate(name string, size int64, fh uint64) int {
 	return errc(g.v.Truncate(g.ctx(), cp(name), size))
 }
 
-func (g *winFS) Read(_ string, buff []byte, ofst int64, fh uint64) int {
+func (g *winFS) Read(name string, buff []byte, ofst int64, fh uint64) int {
+	defer trace("Read", name)()
 	h := g.handle(fh)
 	if h == nil {
 		return -fuse.EBADF

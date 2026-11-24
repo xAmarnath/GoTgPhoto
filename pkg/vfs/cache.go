@@ -26,8 +26,13 @@ const (
 
 type urlEntry struct {
 	url     string
+	err     error
 	expires time.Time
 }
+
+// missingTTL is how long a 404 from the download API is remembered, so shell probes of dead
+// items fail instantly instead of costing a round trip each.
+const missingTTL = 5 * time.Minute
 
 type downloadURLCache struct {
 	mu      sync.Mutex
@@ -46,12 +51,17 @@ func (c *downloadURLCache) Get(ctx context.Context, mediaKey string) (string, er
 	c.mu.Lock()
 	if e, ok := c.entries[mediaKey]; ok && time.Now().Before(e.expires) {
 		c.mu.Unlock()
-		return e.url, nil
+		return e.url, e.err
 	}
 	c.mu.Unlock()
 
 	orig, _, err := c.gp.GetDownloadURL(ctx, mediaKey)
 	if err != nil {
+		if isNotFound(err) {
+			c.mu.Lock()
+			c.entries[mediaKey] = urlEntry{err: err, expires: time.Now().Add(missingTTL)}
+			c.mu.Unlock()
+		}
 		return "", err
 	}
 	if orig == "" {
@@ -225,6 +235,11 @@ func (rc *rangeChunkCache) ReadPhysicalAt(ctx context.Context, hc *http.Client, 
 	return written, nil
 }
 
+func isNotFound(err error) bool {
+	var ae *gpmc.APIError
+	return errors.As(err, &ae) && ae.Status == http.StatusNotFound
+}
+
 func (rc *rangeChunkCache) getBlock(ctx context.Context, hc *http.Client, mediaKey string, blkIdx int64) ([]byte, error) {
 	key := chunkKey{mediaKey: mediaKey, blockIdx: blkIdx}
 
@@ -255,7 +270,7 @@ func (rc *rangeChunkCache) getBlock(ctx context.Context, hc *http.Client, mediaK
 	var err error
 	for try := 0; try < 3; try++ {
 		data, err = rc.fetchBlockHTTP(fetchCtx, hc, mediaKey, blkIdx)
-		if err == nil || errors.Is(err, io.EOF) || fetchCtx.Err() != nil {
+		if err == nil || errors.Is(err, io.EOF) || fetchCtx.Err() != nil || isNotFound(err) {
 			break
 		}
 		time.Sleep(time.Duration(try+1) * 500 * time.Millisecond)

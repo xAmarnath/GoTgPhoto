@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -171,6 +173,11 @@ func (rc *rangeChunkCache) ReadPhysicalAt(ctx context.Context, hc *http.Client, 
 
 	first := physOff / chunkSize
 	if !rc.isRangeOK(mediaKey) {
+		// The video host is known to ignore Range, so skip the probe request (a full round trip).
+		if u, err := rc.urls.Get(ctx, mediaKey); err == nil && noRangeHost(u) {
+			rc.markNoRange(mediaKey)
+			return rc.spoolRead(ctx, hc, mediaKey, p, physOff, totalPhysLimit)
+		}
 		// Probe with a single request before fanning out: an upstream that ignores Range would
 		// otherwise be hit with a full-object download per prefetched block.
 		if _, err := rc.getBlock(ctx, hc, mediaKey, first); errors.Is(err, errNoRange) {
@@ -233,6 +240,11 @@ func (rc *rangeChunkCache) ReadPhysicalAt(ctx context.Context, hc *http.Client, 
 		return written, io.EOF
 	}
 	return written, nil
+}
+
+func noRangeHost(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	return err == nil && strings.HasPrefix(u.Hostname(), "video-downloads.")
 }
 
 func isNotFound(err error) bool {

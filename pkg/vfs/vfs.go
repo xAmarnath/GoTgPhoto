@@ -105,6 +105,7 @@ func New(gp *gpmc.Client, cfg Config) (*FS, error) {
 		chunks.spoolDir = filepath.Join(cfg.TempDir, "gpix-spool")
 	}
 	_ = os.RemoveAll(chunks.spoolDirOrDefault()) // leftovers from a previous run
+	_ = os.RemoveAll(filepath.Join(cfg.TempDir, "gpix-staging"))
 
 	return &FS{
 		gp:       gp,

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -28,6 +29,9 @@ import (
 )
 
 func main() {
+	if addr := os.Getenv("GPIX_PPROF"); addr != "" {
+		go func() { _ = http.ListenAndServe(addr, nil) }()
+	}
 	mode := flag.String("mode", "all", "all | bot | web | fuse | cli | hashpw")
 	cli := flag.Bool("cli", false, "shortcut for -mode cli")
 	hashpw := flag.Bool("hashpw", false, "shortcut for -mode hashpw")
@@ -167,15 +171,15 @@ func runFUSE(ctx context.Context, log *slog.Logger, auth, cfgPath, profileFlag, 
 }
 
 type runtimeController struct {
-	ctx        context.Context
-	log        *slog.Logger
-	envPath    string
-	cfgPath    string
-	enableBot  bool
-	fuseRO     bool
-	fuseDebug  bool
-	webSrv     *web.Server
-	sharedVFS  *vfs.FS
+	ctx       context.Context
+	log       *slog.Logger
+	envPath   string
+	cfgPath   string
+	enableBot bool
+	fuseRO    bool
+	fuseDebug bool
+	webSrv    *web.Server
+	sharedVFS *vfs.FS
 
 	mu             sync.Mutex
 	gp             *gpmc.Client

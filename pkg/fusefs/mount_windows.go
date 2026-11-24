@@ -354,7 +354,14 @@ func (g *winFS) Init() {
 	})
 }
 
-func (g *winFS) ctx() context.Context { return context.Background() }
+// opTimeout bounds backend calls so a stuck request cannot pin a WinFsp worker thread forever.
+const opTimeout = 2 * time.Minute
+
+func (g *winFS) ctx() context.Context {
+	c, cancel := context.WithTimeout(context.Background(), opTimeout)
+	time.AfterFunc(opTimeout, cancel)
+	return c
+}
 
 var traceOps = os.Getenv("GPIX_TRACE") != ""
 
@@ -810,7 +817,10 @@ func (g *winFS) waitPending(p string) {
 	e := g.pending[p]
 	g.dmu.Unlock()
 	if e != nil {
-		<-e.done
+		select {
+		case <-e.done:
+		case <-time.After(opTimeout):
+		}
 	}
 }
 

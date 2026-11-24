@@ -57,7 +57,10 @@ func mountOS(ctx context.Context, v *vfs.FS, opts Options) (Handle, error) {
 	host.SetCapDeleteAccess(true)
 
 	args := []string{
-		"-o", "volname=New GDisk", "-o", "FileSystemName=gpix", "-o", "uid=-1,gid=-1",
+		"-o", "volname=GDisk", "-o", "FileSystemName=gpix", "-o", "uid=-1,gid=-1",
+		// A volume prefix makes Windows treat the drive as a network share (\\gpix\GDisk), which keeps
+		// Explorer from probing files the way it does on local disks.
+		`--VolumePrefix=\gpix\GDisk`,
 		"-o", "FileInfoTimeout=3000", "-o", "DirInfoTimeout=3000", "-o", "VolumeInfoTimeout=30000",
 	}
 	if opts.ReadOnly {
@@ -451,6 +454,7 @@ func (l *lazyFile) get() (*vfs.FileHandle, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.fh == nil {
+		l.g.waitPending(l.path)
 		fh, err := l.g.v.OpenFile(l.g.ctx(), l.path, l.flags, 0o644)
 		if err != nil {
 			return nil, err
@@ -641,8 +645,10 @@ func goFlags(f int) int {
 
 func (g *winFS) Open(name string, flags int) (int, uint64) {
 	defer trace("Open", name)()
-	g.waitPending(cp(name))
 	p := cp(name)
+	// Copy tools reopen each file just after writing it, only to set times; waiting for its
+	// upload here would serialise a whole copy, so a pending file waits at first data access.
+	pending := g.pendingInfo(p) != nil
 	ni, err := g.lstat(p)
 	if err != nil {
 		return errc(err), ^uint64(0)
@@ -651,7 +657,7 @@ func (g *winFS) Open(name string, flags int) (int, uint64) {
 		return 0, ^uint64(0)
 	}
 	gf := goFlags(flags)
-	if flags&(fuse.O_WRONLY|fuse.O_RDWR|fuse.O_TRUNC|fuse.O_APPEND) == 0 {
+	if pending || flags&(fuse.O_WRONLY|fuse.O_RDWR|fuse.O_TRUNC|fuse.O_APPEND) == 0 {
 		return 0, g.addHandle(&lazyFile{g: g, path: p, flags: gf, size: ni.FileSize})
 	}
 	fh, err := g.v.OpenFile(g.ctx(), p, gf, 0o644)

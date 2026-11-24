@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -182,12 +183,15 @@ func (c *Client) uploadSource(ctx context.Context, src uploadSource, opts Upload
 	}
 
 	emit(StageCommit, size, size, nil)
-	key, err := c.commitUpload(ctx, receipt, src.name, digest, opts.Quality, c.profile, src.mtime)
+	key, err := c.commitSerialized(ctx, func() (string, error) {
+		return c.commitUpload(ctx, receipt, src.name, digest, opts.Quality, c.profile, src.mtime)
+	})
 	if err != nil {
 		return fail(StageCommit, size, err)
 	}
 
 	res.MediaKey = key
+	c.seedMaterialized(MediaItem{MediaKey: key, Filename: src.name, SizeBytes: size, Mtime: src.mtime, SHA1: digest})
 	c.InvalidateSyncCache()
 	emit(StageDone, size, size, nil)
 	return res, nil
@@ -272,3 +276,37 @@ func expandPaths(paths []string, recursive bool) ([]string, error) {
 }
 
 var _ = time.Now
+
+// seedMaterialized records a just-uploaded item so the first lookup of it does not have to scan
+// listing pages for it.
+func (c *Client) seedMaterialized(it MediaItem) {
+	c.matMu.Lock()
+	defer c.matMu.Unlock()
+	if c.matItems == nil {
+		c.matItems = map[string]MediaItem{}
+		c.matMiss = map[string]time.Time{}
+	}
+	c.matItems[it.MediaKey] = it
+}
+
+// commitSerialized runs commits one at a time and retries when the backend aborts one (HTTP
+// 409), which is what overlapping commits from a parallel copy provoke.
+func (c *Client) commitSerialized(ctx context.Context, commit func() (string, error)) (string, error) {
+	c.commitMu.Lock()
+	defer c.commitMu.Unlock()
+	var key string
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		key, err = commit()
+		var ae *APIError
+		if err == nil || !errors.As(err, &ae) || ae.Status != http.StatusConflict {
+			return key, err
+		}
+		select {
+		case <-time.After(time.Duration(attempt+1) * time.Second):
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return key, err
+}

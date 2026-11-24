@@ -44,8 +44,22 @@ func (c *Client) DeleteByMediaKeys(ctx context.Context, mediaKeys []string, perm
 	}
 	found := make(map[string]string)
 	results := make(map[string]error, len(mediaKeys))
+	// The cached library snapshot answers most lookups without walking the listing page by page.
+	snapOK := false
+	if snap, err := c.getSync(ctx); err == nil {
+		for k := range wanted {
+			if it, ok := snap.itemsByKey[k]; ok && len(it.SHA1) > 0 {
+				found[k] = it.DedupKey()
+			}
+		}
+		c.syncMu.Lock()
+		snapOK = c.sync != nil && !c.sync.invalid
+		c.syncMu.Unlock()
+	}
 	cursor := ""
-	for {
+	// A current snapshot that lacks a key means the item is already gone; paging the whole
+	// library to confirm that can take minutes.
+	for len(found) < len(wanted) && !snapOK {
 		page, err := c.ListPage(ctx, cursor)
 		if err != nil {
 			return nil, err

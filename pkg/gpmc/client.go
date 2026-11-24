@@ -31,6 +31,7 @@ type Client struct {
 	sync       *syncCache
 	syncFlight *syncFlight
 
+	commitMu sync.Mutex
 	matMu    sync.Mutex
 	matItems map[string]MediaItem
 	matMiss  map[string]time.Time

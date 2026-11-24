@@ -60,8 +60,10 @@ func mountOS(ctx context.Context, v *vfs.FS, opts Options) (Handle, error) {
 		"-o", "volname=GDisk", "-o", "FileSystemName=gpix", "-o", "uid=-1,gid=-1",
 		// A volume prefix makes Windows treat the drive as a network share (\\gpix\GDisk), which keeps
 		// Explorer from probing files the way it does on local disks.
-		`--VolumePrefix=\gpix\GDisk`,
 		"-o", "FileInfoTimeout=3000", "-o", "DirInfoTimeout=3000", "-o", "VolumeInfoTimeout=30000",
+	}
+	if os.Getenv("GPIX_NETDRIVE") != "" {
+		args = append(args, `--VolumePrefix=\gpix\GDisk`)
 	}
 	if opts.ReadOnly {
 		args = append(args, "-o", "ro")
@@ -366,7 +368,10 @@ func (g *winFS) ctx() context.Context {
 	return c
 }
 
-var traceOps = os.Getenv("GPIX_TRACE") != ""
+var (
+	traceOps = os.Getenv("GPIX_TRACE") != ""
+	traceAll = os.Getenv("GPIX_TRACE") == "all"
+)
 
 // trace logs filesystem calls slower than 500 ms when GPIX_TRACE is set.
 func trace(op, name string) func() {
@@ -375,7 +380,10 @@ func trace(op, name string) func() {
 	}
 	t := time.Now()
 	return func() {
-		if d := time.Since(t); d > 500*time.Millisecond {
+		d := time.Since(t)
+		if traceAll {
+			fmt.Fprintf(os.Stderr, "%s %s %s +%v\n", t.Format("15:04:05.000"), op, name, d.Round(time.Millisecond))
+		} else if d > 500*time.Millisecond {
 			fmt.Fprintf(os.Stderr, "SLOW %s %s %v\n", op, name, d.Round(time.Millisecond))
 		}
 	}
@@ -562,6 +570,7 @@ func (g *winFS) addHandle(h *lazyFile) uint64 {
 }
 
 func (g *winFS) Statfs(_ string, st *fuse.Statfs_t) int {
+	defer trace("Statfs", "")()
 	qi, err := g.v.Statfs(g.ctx())
 	if err != nil {
 		return errc(err)
@@ -597,11 +606,13 @@ func (g *winFS) Getattr(name string, st *fuse.Stat_t, fh uint64) int {
 }
 
 func (g *winFS) Access(name string, _ uint32) int {
+	defer trace("Access", name)()
 	_, err := g.lstat(cp(name))
 	return errc(err)
 }
 
 func (g *winFS) Readdir(name string, fill func(string, *fuse.Stat_t, int64) bool, _ int64, _ uint64) int {
+	defer trace("Readdir", name)()
 	items, err := g.listDir(cp(name))
 	if err != nil {
 		return errc(err)
@@ -794,7 +805,8 @@ func (g *winFS) Read(name string, buff []byte, ofst int64, fh uint64) int {
 	return n
 }
 
-func (g *winFS) Write(_ string, buff []byte, ofst int64, fh uint64) int {
+func (g *winFS) Write(name string, buff []byte, ofst int64, fh uint64) int {
+	defer trace("Write", name)()
 	h := g.handle(fh)
 	if h == nil {
 		return -fuse.EBADF
@@ -808,7 +820,10 @@ func (g *winFS) Write(_ string, buff []byte, ofst int64, fh uint64) int {
 
 // Flush and Fsync are no-ops: committing uploads the whole file, so doing it on every flush
 // would re-upload partial content. Data is committed once, when the last handle closes.
-func (g *winFS) Flush(string, uint64) int       { return 0 }
+func (g *winFS) Flush(name string, _ uint64) int {
+	defer trace("Flush", name)()
+	return 0
+}
 func (g *winFS) Fsync(string, bool, uint64) int { return 0 }
 
 // pendingEntry describes a closed file whose upload is still running in the background. It

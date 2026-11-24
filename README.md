@@ -238,3 +238,10 @@ Fully static, ~25 MB stripped. Drop the binary on any Linux box with `.env` and 
 ## License
 
 [MIT](LICENSE).
+
+## Mounting as a disk
+
+`-mode fuse -mount <target>` mounts the library as a real filesystem.
+
+- **Linux:** FUSE, `-mount /mnt/gpix`.
+- **Windows:** [WinFsp](https://winfsp.dev) must be installed. Mount on a drive letter, `gpix.exe -mode fuse -mount G:`. Directory listings are cached (stale-while-revalidate, persisted in `%LOCALAPPDATA%\gpix\dircache.json`), file opens are lazy, and the volume reports a 40 TB pool.

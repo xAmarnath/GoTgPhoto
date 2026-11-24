@@ -208,7 +208,31 @@ func (f *FS) LogicalModTime(it gpmc.MediaItem) time.Time {
 	return time.Now()
 }
 
+// virtualCapacity is the size reported for the mount: the spoofed Pixel plan has unlimited
+// storage, so the real 15 GiB quota is replaced by a large fixed pool.
+const virtualCapacity = uint64(40) << 40
+
 func (f *FS) Statfs(ctx context.Context) (QuotaInfo, error) {
+	q, err := f.statfsRaw(ctx)
+	if err != nil {
+		return q, err
+	}
+	bs := uint64(q.BlockSize)
+	if bs == 0 {
+		bs = 4096
+		q.BlockSize = 4096
+	}
+	used := min(q.UsedBytes, virtualCapacity)
+	q.TotalBytes = virtualCapacity
+	q.AvailBytes = virtualCapacity - used
+	q.Unlimited = true
+	q.TotalBlocks = virtualCapacity / bs
+	q.FreeBlocks = q.AvailBytes / bs
+	q.AvailBlocks = q.FreeBlocks
+	return q, nil
+}
+
+func (f *FS) statfsRaw(ctx context.Context) (QuotaInfo, error) {
 	f.quotaMu.Lock()
 	have := !f.quotaAt.IsZero()
 	fresh := have && time.Since(f.quotaAt) < 45*time.Second

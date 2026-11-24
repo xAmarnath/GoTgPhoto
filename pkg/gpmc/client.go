@@ -58,7 +58,9 @@ func New(authData string, opts ...Option) (*Client, error) {
 			Proxy:                 http.ProxyFromEnvironment,
 			TLSHandshakeTimeout:   30 * time.Second,
 			ResponseHeaderTimeout: 60 * time.Second,
-			MaxIdleConns:          16,
+			MaxIdleConns:          128,
+			MaxIdleConnsPerHost:   32,
+			ForceAttemptHTTP2:     true,
 			IdleConnTimeout:       90 * time.Second,
 		}
 		if c.proxy != "" {

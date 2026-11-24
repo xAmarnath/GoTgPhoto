@@ -18,7 +18,8 @@ import (
 
 const (
 	chunkSize       = 1 << 20 // 1 MiB per cached range block
-	defaultMaxChunk = 24      // 24 MiB bounded RAM cache
+	defaultMaxChunk = 160     // 160 MiB bounded RAM cache
+	readAheadBlocks = 8       // sequential prefetch depth, fetched in parallel
 	urlCacheTTL     = 45 * time.Minute
 	maxDiskCache    = 512 << 20 // 512 MiB bounded disk decrypt cache
 )
@@ -136,6 +137,31 @@ func (rc *rangeChunkCache) ReadPhysicalAt(ctx context.Context, hc *http.Client, 
 	if totalPhysLimit > 0 && physOff+int64(want) > totalPhysLimit {
 		want = int(totalPhysLimit - physOff)
 	}
+
+	first := physOff / chunkSize
+	last := (physOff + int64(want) - 1) / chunkSize
+	var limitBlk int64 = -1
+	if totalPhysLimit > 0 {
+		limitBlk = (totalPhysLimit - 1) / chunkSize
+	}
+
+	// Fetch every block this read touches concurrently (duplicates collapse via inflight),
+	// and start prefetching the following blocks for sequential access.
+	var wg sync.WaitGroup
+	for b := first + 1; b <= last; b++ {
+		wg.Add(1)
+		go func(b int64) {
+			defer wg.Done()
+			_, _ = rc.getBlock(ctx, hc, mediaKey, b)
+		}(b)
+	}
+	for b := last + 1; b <= last+readAheadBlocks; b++ {
+		if limitBlk >= 0 && b > limitBlk {
+			break
+		}
+		go func(b int64) { _, _ = rc.getBlock(context.Background(), hc, mediaKey, b) }(b)
+	}
+	defer wg.Wait()
 
 	written := 0
 	for written < want {

@@ -8,7 +8,7 @@ import (
 	"gpix/pkg/vfs"
 )
 
-var ErrUnsupported = errors.New("fusefs: FUSE mounting is only supported on Linux")
+var ErrUnsupported = errors.New("fusefs: mounting is only supported on Linux (FUSE) and Windows (WinFsp)")
 
 type Options struct {
 	MountPoint string

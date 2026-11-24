@@ -270,7 +270,7 @@ func (rc *rangeChunkCache) getBlock(ctx context.Context, hc *http.Client, mediaK
 	var err error
 	for try := 0; try < 3; try++ {
 		data, err = rc.fetchBlockHTTP(fetchCtx, hc, mediaKey, blkIdx)
-		if err == nil || errors.Is(err, io.EOF) || fetchCtx.Err() != nil || isNotFound(err) {
+		if err == nil || errors.Is(err, io.EOF) || fetchCtx.Err() != nil || isNotFound(err) || errors.Is(err, errNoRange) {
 			break
 		}
 		time.Sleep(time.Duration(try+1) * 500 * time.Millisecond)
@@ -355,7 +355,10 @@ func (rc *rangeChunkCache) fetchBlockHTTP(ctx context.Context, hc *http.Client, 
 			// Upstream (video-downloads.googleusercontent.com) ignores Range and streams the
 			// whole object; stop fetching blocks and switch this item to a sequential spool.
 			rc.markNoRange(mediaKey)
-			_, _ = rc.newSpool(hc, mediaKey, resp)
+			// resp is bound to this fetch's context, which is cancelled on return, so the spool
+			// opens its own request instead of adopting it.
+			resp.Body.Close()
+			_, _ = rc.newSpool(hc, mediaKey, nil)
 			return nil, errNoRange
 		}
 		buf, err := io.ReadAll(io.LimitReader(resp.Body, chunkSize))
